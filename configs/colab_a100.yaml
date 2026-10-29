@@ -17,22 +17,22 @@ lora:
     - "down_proj"
 
 training:
-  learning_rate: 5.0e-6
+  learning_rate: 3.0e-6
   max_steps: 500
   per_device_train_batch_size: 1
   gradient_accumulation_steps: 4
   logging_steps: 5
   save_steps: 50
-  kl_beta: 0.04
+  kl_beta: 0.06
 
 rollout:
   group_size: 4
-  max_tokens: 1500
+  max_tokens: 2200
 
 rewards:
   weights:
-    w_length: 0.35
-    w_coherence: 0.35
+    w_length: 0.40
+    w_coherence: 0.30
     w_quality: 0.30
 
   coherence:
@@ -43,9 +43,8 @@ rewards:
   quality:
     fluency_evaluator: "Qwen/Qwen2.5-0.5B"
     fluency_sigma_ref: 10.0
-    alpha_fluency: 0.40
-    beta_richness: 0.35
+    alpha_fluency: 0.55
+    beta_richness: 0.20
     gamma_burstiness: 0.25
     burstiness_mu0: 6.0
     burstiness_sigma0: 4.0
-

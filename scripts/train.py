@@ -94,6 +94,40 @@ def _per_item(values: Any, size: int, default: Any) -> List[Any]:
     return [default] * size
 
 
+def extract_target_words_from_text(prompt_text: str, fallback: int = 1400) -> int:
+    if not prompt_text:
+        return fallback
+    clean = prompt_text.replace(",", "")
+    match = re.search(r"Total Target Length:\s*Approximately\s*(\d+)\s*words", clean, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"between\s+(\d+)\s*(?:and|to|–|-)\s*(\d+)\s*words", clean, re.IGNORECASE)
+    if match:
+        return (int(match.group(1)) + int(match.group(2))) // 2
+    match = re.search(r"(\d{3,5})\s*words", clean, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return fallback
+
+
+def extract_context_from_prompt(prompt_text: str) -> str:
+    if not prompt_text:
+        return ""
+    match = re.search(r"\[CONTEXT SUMMARY\]:\s*([\s\S]*?)(?=\n\n\[|\n\[CHAPTER GOAL\])", prompt_text)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def extract_tail_from_prompt(prompt_text: str) -> str:
+    if not prompt_text:
+        return ""
+    match = re.search(r"\[PRECEDING SCENE CONTINUATION.*?\]:\s*([\s\S]*?)(?=\n\n\[|\n\[CHAPTER GOAL\])", prompt_text)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
 class IntrinsicRewardFunctions:
     """Lazy, shared reward engine exposed in TRL's reward-function interface."""
 
@@ -114,9 +148,32 @@ class IntrinsicRewardFunctions:
     def _components(self, completions: Sequence[Any], **kwargs: Any) -> Dict[str, List[float]]:
         texts = [_as_text(item) for item in completions]
         count = len(texts)
-        targets = [int(v) for v in _per_item(kwargs.get("target_words"), count, 1200)]
-        contexts = [str(v) for v in _per_item(kwargs.get("context_summary"), count, "")]
-        tails = [str(v) for v in _per_item(kwargs.get("prev_chapter_tail"), count, "")]
+
+        # 1. Resolve prompts
+        raw_prompts = kwargs.get("prompts")
+        prompt_texts = [_as_text(p) for p in _per_item(raw_prompts, count, "")] if raw_prompts is not None else [""] * count
+
+        # 2. Resolve target_words dynamically from prompt or dataset kwargs
+        kw_targets = kwargs.get("target_words")
+        if kw_targets is not None:
+            targets = [int(v) for v in _per_item(kw_targets, count, 1400)]
+        else:
+            targets = [extract_target_words_from_text(p, 1400) for p in prompt_texts]
+
+        # 3. Resolve context_summary
+        kw_contexts = kwargs.get("context_summary")
+        if kw_contexts is not None:
+            contexts = [str(v) for v in _per_item(kw_contexts, count, "")]
+        else:
+            contexts = [extract_context_from_prompt(p) for p in prompt_texts]
+
+        # 4. Resolve prev_chapter_tail
+        kw_tails = kwargs.get("prev_chapter_tail")
+        if kw_tails is not None:
+            tails = [str(v) for v in _per_item(kw_tails, count, "")]
+        else:
+            tails = [extract_tail_from_prompt(p) for p in prompt_texts]
+
         cache_key = (tuple(texts), tuple(targets), tuple(contexts), tuple(tails))
         if self._cache_key == cache_key and self._cache_value is not None:
             return self._cache_value
