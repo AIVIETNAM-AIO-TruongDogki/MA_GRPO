@@ -45,10 +45,20 @@ def _apply_chatglm_patches():
         import transformers.modeling_utils
 
         def get_safe_tied(self):
-            val = getattr(self, "_tied_weights_keys", None)
-            return val if (val is not None and hasattr(val, "keys")) else {}
+            val = self.__dict__.get("_custom_all_tied_weights_keys", None)
+            if val is not None and hasattr(val, "keys"):
+                return val
+            val2 = getattr(self, "_tied_weights_keys", None)
+            return val2 if (val2 is not None and hasattr(val2, "keys")) else {}
 
-        transformers.modeling_utils.PreTrainedModel.all_tied_weights_keys = property(get_safe_tied)
+        def set_safe_tied(self, value):
+            self.__dict__["_custom_all_tied_weights_keys"] = (
+                value if (value is not None and hasattr(value, "keys")) else {}
+            )
+
+        transformers.modeling_utils.PreTrainedModel.all_tied_weights_keys = property(
+            get_safe_tied, set_safe_tied
+        )
     except Exception:
         pass
 
