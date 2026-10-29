@@ -25,7 +25,22 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # Setup paths
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATASET = PROJECT_ROOT.parent / "Dataset" / "tell_me_a_story_data" / "tell-me-a-story-test.jsonl"
+
+
+def resolve_dataset_path(given_path: str = None) -> Path:
+    if given_path and Path(given_path).exists():
+        return Path(given_path)
+    candidates = [
+        PROJECT_ROOT / "data" / "tell-me-a-story-test.jsonl",
+        PROJECT_ROOT / "data" / "chapters.jsonl",
+        PROJECT_ROOT.parent / "Dataset" / "tell_me_a_story_data" / "tell-me-a-story-test.jsonl",
+        Path("/content/MA-GRPO/data/tell-me-a-story-test.jsonl"),
+        Path("/content/MA-GRPO/data/chapters.jsonl"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
 
 
 def extract_target_length(text: str, default_len: int = 1500) -> int:
@@ -165,26 +180,28 @@ def run_benchmark(
     model.eval()
 
     # 2. Read test samples
+    real_dataset_path = resolve_dataset_path(dataset_path)
+    print(f"Loading benchmark samples from: {real_dataset_path}")
     samples = []
-    if os.path.exists(dataset_path):
-        with open(dataset_path, "r", encoding="utf-8") as f:
+    if real_dataset_path.exists():
+        with open(real_dataset_path, "r", encoding="utf-8-sig") as f:
             for idx, line in enumerate(f):
                 if idx >= num_samples:
                     break
                 if line.strip():
                     samples.append(json.loads(line))
     else:
-        print(f"Dataset path {dataset_path} not found.")
+        print(f"Error: Dataset path {real_dataset_path} not found.")
         return
 
     # 3. Generate prose
     generated_records = []
     for i, s in enumerate(samples):
-        premise = s.get("inputs", "")
-        target_len = extract_target_length(premise, 1400)
-        gold_ref = s.get("targets", "")
-
-        prompt = f"""You are an elite literary novelist. Write the complete narrative prose for this story.
+        if "inputs" in s:
+            premise = s.get("inputs", "")
+            target_len = extract_target_length(premise, 1400)
+            gold_ref = s.get("targets", "")
+            prompt = f"""You are an elite literary novelist. Write the complete narrative prose for this story.
 Total Target Length: Approximately {target_len} words.
 
 [CONTEXT SUMMARY]:
@@ -195,6 +212,10 @@ CRITICAL WRITING INSTRUCTIONS:
 2. Output the full story prose immediately after </think>.
 Begin with <think> now:
 """
+        else:
+            prompt = s.get("prompt", "")
+            target_len = int(s.get("target_words", 1200))
+            gold_ref = ""
 
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         print(f"\n[Sample {i+1}/{num_samples}] Generating story (Target: {target_len} words)...")
@@ -276,7 +297,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", default="/content/drive/MyDrive/MA-GRPO-Checkpoints/ma-grpo-final/checkpoint-50")
     parser.add_argument("--base-model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--samples", type=int, default=3)
-    parser.add_argument("--dataset", default=str(DEFAULT_DATASET))
+    parser.add_argument("--dataset", default=None)
     parser.add_argument("--output", default="benchmark_comparison_results.csv")
     args = parser.parse_args()
 
@@ -287,3 +308,4 @@ if __name__ == "__main__":
         dataset_path=args.dataset,
         output_csv=args.output,
     )
+
