@@ -96,6 +96,27 @@ def run_ma_grpo_checkpoint_benchmark(
     print("=" * 85, flush=True)
     clean_gpu_memory()
 
+    try:
+        import transformers.modeling_utils
+
+        def _get_safe_tied(self):
+            val = self.__dict__.get("_custom_all_tied_weights_keys", None)
+            if val is not None and hasattr(val, "keys"):
+                return val
+            val2 = getattr(self, "_tied_weights_keys", None)
+            return val2 if (val2 is not None and hasattr(val2, "keys")) else {}
+
+        def _set_safe_tied(self, value):
+            self.__dict__["_custom_all_tied_weights_keys"] = (
+                value if (value is not None and hasattr(value, "keys")) else {}
+            )
+
+        transformers.modeling_utils.PreTrainedModel.all_tied_weights_keys = property(
+            _get_safe_tied, _set_safe_tied
+        )
+    except Exception:
+        pass
+
     use_cuda = torch.cuda.is_available()
     compute_dtype = (
         torch.bfloat16 if (use_cuda and torch.cuda.is_bf16_supported()) else (torch.float16 if use_cuda else torch.float32)
