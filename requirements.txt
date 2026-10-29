@@ -1,0 +1,29 @@
+# Core Deep Learning & Acceleration for Server 40GB (A100 / A6000 / L40)
+torch>=2.3.0
+transformers>=4.45.0
+accelerate>=0.33.0
+peft>=0.12.0
+# GRPOTrainer / GRPOConfig are required by scripts/train.py.
+trl>=0.15.0
+datasets>=2.20.0
+bitsandbytes>=0.43.0
+einops>=0.8.0
+
+# Inference Rollout Engine (PagedAttention & FlashAttention-2)
+# vllm>=0.6.0
+# flash-attn>=2.5.0  # Optional: PyTorch SDPA is used natively by default without compiling from source
+
+# Intrinsic Reward & Metrics Evaluation
+sentence-transformers>=3.0.0
+nltk>=3.8.1
+rouge-score>=0.1.2
+pydantic>=2.7.0
+pyyaml>=6.0.1
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Training Logging & Tracking
+tqdm>=4.66.0
+tensorboard>=2.16.0
+wandb>=0.17.0
