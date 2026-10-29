@@ -244,6 +244,82 @@ def run_longwriter_llama_benchmark(
     return save_model_result_csv(records, output_csv)
 
 
+def _chatglm_kv_generate(
+    model,
+    tokenizer,
+    inputs: Dict[str, torch.Tensor],
+    max_new_tokens: int,
+    temperature: float = 0.5,
+    top_p: float = 0.9,
+    repetition_penalty: float = 1.05,
+) -> torch.Tensor:
+    """
+    Direct KV-Cached autoregressive decoding loop for ChatGLM4 (`THUDM/LongWriter-glm4-9b`).
+    Completely bypasses `transformers` GenerationMixin / DynamicCache incompatibilities
+    while preserving 100% GPU KV-cache speed via `model(..., past_key_values=..., return_last_logit=True)`.
+    """
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
+    generated = input_ids.clone()
+    past_key_values = None
+
+    eos_ids = set()
+    if tokenizer.eos_token_id is not None:
+        if isinstance(tokenizer.eos_token_id, int):
+            eos_ids.add(tokenizer.eos_token_id)
+        else:
+            eos_ids.update(tokenizer.eos_token_id)
+    for tok_str in ["<|endoftext|>", "<|user|>", "<|observation|>"]:
+        try:
+            tid = tokenizer.convert_tokens_to_ids(tok_str)
+            if isinstance(tid, int) and tid > 0:
+                eos_ids.add(tid)
+        except Exception:
+            pass
+
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            curr_input_ids = generated if past_key_values is None else generated[:, -1:]
+            out = model(
+                input_ids=curr_input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_last_logit=True,
+            )
+            logits = out.logits[:, -1, :].float()
+            past_key_values = out.past_key_values
+
+            if repetition_penalty != 1.0:
+                score = torch.gather(logits, 1, generated)
+                score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                logits.scatter_(1, generated, score)
+
+            if temperature > 0.01:
+                logits = logits / temperature
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = False
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits = logits.masked_fill(indices_to_remove, float("-inf"))
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+            generated = torch.cat([generated, next_token], dim=-1)
+            attention_mask = torch.cat(
+                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+            )
+
+            if next_token.item() in eos_ids:
+                break
+
+    return generated
+
+
 # =============================================================================
 # MODEL 5: LongWriter-glm4-9b (`THUDM/LongWriter-glm4-9b` / `zai-org/LongWriter-glm4-9b`)
 # =============================================================================
@@ -255,7 +331,7 @@ def run_longwriter_glm_benchmark(
 ):
     """
     Official LongWriter-glm4-9b runner (`THUDM/LongWriter-glm4-9b` with fallback to `zai-org/LongWriter-glm4-9b`).
-    Applies ChatGLM4 DynamicCache & tied-weights patches for full speed generation.
+    Uses direct KV-cached forward decoding (`_chatglm_kv_generate`) to guarantee zero GenerationMixin errors.
     """
     print("\n" + "=" * 85, flush=True)
     print(f"RUNNING MODEL [5/8]: LongWriter-glm4-9b ({model_id})", flush=True)
@@ -276,6 +352,7 @@ def run_longwriter_glm_benchmark(
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_use_double_quant=True,
+            llm_int8_enable_fp32_cpu_offload=True,
         )
 
     # Try THUDM/LongWriter-glm4-9b first, fallback to zai-org/LongWriter-glm4-9b
@@ -299,7 +376,7 @@ def run_longwriter_glm_benchmark(
     load_kwargs: Dict[str, Any] = {
         "config": model_config,
         "torch_dtype": compute_dtype,
-        "device_map": "auto" if use_cuda else None,
+        "device_map": ({"": 0} if vram_total >= 22.0 else "auto") if use_cuda else None,
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
     }
@@ -307,55 +384,7 @@ def run_longwriter_glm_benchmark(
         load_kwargs["quantization_config"] = quant_config
 
     model = AutoModelForCausalLM.from_pretrained(resolved_id, **load_kwargs)
-    if not hasattr(model, "all_tied_weights_keys") or getattr(model, "all_tied_weights_keys", None) is None:
-        model.all_tied_weights_keys = {}
-
-    # Patch ChatGLM model class methods for transformers >= 4.45 / 5.x compatibility
-    model_cls = type(model)
-
-    def _extract_past_from_model_output(self, outputs, standardize_cache_format=False):
-        past = getattr(outputs, "past_key_values", None)
-        return "past_key_values", past
-
-    model_cls._extract_past_from_model_output = _extract_past_from_model_output
-    model_cls._prepare_cache_for_generation = lambda self, *args, **kwargs: None
-
-    if hasattr(model_cls, "_update_model_kwargs_for_generation"):
-        orig_update_kwargs = model_cls._update_model_kwargs_for_generation
-
-        def _safe_update_model_kwargs_for_generation(
-            self, outputs, model_kwargs, is_encoder_decoder=False, standardize_cache_format=False, **kwargs
-        ):
-            return orig_update_kwargs(
-                self,
-                outputs,
-                model_kwargs,
-                is_encoder_decoder=is_encoder_decoder,
-                standardize_cache_format=standardize_cache_format,
-            )
-
-        model_cls._update_model_kwargs_for_generation = _safe_update_model_kwargs_for_generation
-
-    if hasattr(model_cls, "prepare_inputs_for_generation"):
-        orig_prep_inputs = model_cls.prepare_inputs_for_generation
-
-        def _safe_prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
-            if past_key_values is not None:
-                try:
-                    if len(past_key_values) == 0 or (
-                        hasattr(past_key_values, "get_seq_length") and past_key_values.get_seq_length() == 0
-                    ):
-                        past_key_values = None
-                    elif isinstance(past_key_values, (tuple, list)) and past_key_values[0] is None:
-                        past_key_values = None
-                except Exception:
-                    past_key_values = None
-            return orig_prep_inputs(self, input_ids, past_key_values=past_key_values, **kwargs)
-
-        model_cls.prepare_inputs_for_generation = _safe_prepare_inputs_for_generation
-
     _sanitize_model_generation_config(model, tokenizer)
-
     model.eval()
     print(f"[LongWriter-glm4-9b] Loaded {resolved_id} successfully!", flush=True)
 
@@ -379,24 +408,18 @@ def run_longwriter_glm_benchmark(
                 dev = next(model.parameters()).device
                 inputs = {k: v.to(dev) for k, v in inputs.items() if k != "token_type_ids"}
 
-            gen_kwargs = {
-                "max_new_tokens": min(4096, max(1800, int(t_len * 1.45))),
-                "temperature": 0.5,
-                "top_p": 0.9,
-                "do_sample": True,
-                "pad_token_id": tokenizer.pad_token_id,
-                "eos_token_id": tokenizer.eos_token_id,
-            }
+            max_new_toks = min(4096, max(1800, int(t_len * 1.45)))
 
             t0 = time.time()
-            try:
-                with torch.no_grad():
-                    outputs = model.generate(**inputs, **gen_kwargs)
-            except Exception as e:
-                print(f"    [ChatGLM Cache Fallback use_cache=False]: {e}", flush=True)
-                gen_kwargs["use_cache"] = False
-                with torch.no_grad():
-                    outputs = model.generate(**inputs, **gen_kwargs)
+            outputs = _chatglm_kv_generate(
+                model=model,
+                tokenizer=tokenizer,
+                inputs=inputs,
+                max_new_tokens=max_new_toks,
+                temperature=0.5,
+                top_p=0.9,
+                repetition_penalty=1.05,
+            )
 
             elapsed = round(max(0.01, time.time() - t0), 2)
             in_len = inputs["input_ids"].shape[1]
@@ -440,13 +463,15 @@ def run_longwriter_zero_benchmark(
 
     Key Fixes Over Prior Incomplete Setup:
       1. Memory-Safe 4-Bit NF4 Double Quantization (`bnb_4bit_use_double_quant=True`,
-         `low_cpu_mem_usage=True`) reducing 32B footprint from 65 GB to ~18.2 GB VRAM.
+         `llm_int8_enable_fp32_cpu_offload=True`, `low_cpu_mem_usage=True`) reducing 32B
+         footprint from 65 GB to ~18.2 GB VRAM.
       2. Smart Hardware Allocation:
-         - On A100 (40/80GB), L4 (24GB), or Dual T4 (30GB): fits 100% in GPU VRAM.
-         - On Single T4 (15GB): enables `llm_int8_enable_fp32_cpu_offload=True` with explicit
-           `max_memory` and `offload_folder` so it never crashes with OOM.
+         - On A100 (40/80GB) or L4 (24GB): uses `device_map={"": 0}` so 100% of layers
+           reside in GPU VRAM without `accelerate` mistakenly spilling layers to CPU.
+         - On Dual T4 (30GB) or Single T4 (15GB): enables `llm_int8_enable_fp32_cpu_offload=True`
+           with explicit `max_memory` and `offload_folder` so it never crashes.
       3. Full Test-Time Scaling (`<think>...</think><answer>...</answer>`) token budget:
-         Allocates `max_new_tokens = max(3600, int(target_len * 2.2))` so the internal
+         Allocates `max_new_tokens = max(3600, int(target_len * 2.25))` so the internal
          `<think>` outline (~800-1200 tokens) + `<answer>` story (~1500-2500 tokens)
          both complete without mid-story truncation.
     """
@@ -454,6 +479,7 @@ def run_longwriter_zero_benchmark(
     print(f"RUNNING MODEL [6/8]: LongWriter-Zero-32B ({model_id} - 4-bit NF4 Pure RL GRPO)", flush=True)
     print("=" * 85, flush=True)
     clean_gpu_memory()
+    _apply_chatglm_patches()
 
     use_cuda = torch.cuda.is_available()
     vram_total = _total_gpu_vram_gb()
@@ -462,13 +488,12 @@ def run_longwriter_zero_benchmark(
         torch.bfloat16 if (use_cuda and torch.cuda.is_bf16_supported()) else (torch.float16 if use_cuda else torch.float32)
     )
 
-    enable_cpu_offload = use_cuda and (vram_total < 21.0)
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=compute_dtype,
         bnb_4bit_use_double_quant=True,
-        llm_int8_enable_fp32_cpu_offload=enable_cpu_offload,
+        llm_int8_enable_fp32_cpu_offload=True,
     )
 
     resolved_id = model_id
@@ -484,24 +509,28 @@ def run_longwriter_zero_benchmark(
     load_kwargs: Dict[str, Any] = {
         "quantization_config": quant_config if use_cuda else None,
         "torch_dtype": compute_dtype,
-        "device_map": "auto" if use_cuda else None,
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
     }
 
-    if enable_cpu_offload:
+    if not use_cuda:
+        load_kwargs["device_map"] = None
+    elif num_gpus == 1 and vram_total >= 22.0:
+        # Force 100% onto GPU 0 on A100 (40/80GB) or L4 (24GB) so accelerate never offloads to CPU
+        load_kwargs["device_map"] = {"": 0}
+        print(f"[LongWriter-Zero-32B] High-VRAM GPU ({vram_total:.1f} GB) detected: pinning 100% to cuda:0.", flush=True)
+    elif num_gpus >= 2 and vram_total >= 26.0:
+        load_kwargs["device_map"] = "auto"
+        load_kwargs["max_memory"] = {i: "13.8GiB" for i in range(num_gpus)}
+        load_kwargs["max_memory"]["cpu"] = "32GiB"
+        print(f"[LongWriter-Zero-32B] Multi-GPU ({vram_total:.1f} GB) detected: sharding across {num_gpus} GPUs.", flush=True)
+    else:
         offload_dir = "/tmp/offload_longwriter_zero32b"
         os.makedirs(offload_dir, exist_ok=True)
+        load_kwargs["device_map"] = "auto"
         load_kwargs["offload_folder"] = offload_dir
-        load_kwargs["max_memory"] = {0: "13.5GiB", "cpu": "38GiB"}
-        print("[LongWriter-Zero-32B] Single <21GB GPU detected: enabled safe GPU+CPU offload.", flush=True)
-    elif num_gpus >= 2 and vram_total < 35.0:
-        # Balanced sharding across Dual T4 (2x 15GB)
-        load_kwargs["max_memory"] = {i: "13.8GiB" for i in range(num_gpus)}
-        load_kwargs["max_memory"]["cpu"] = "28GiB"
-        print(f"[LongWriter-Zero-32B] Dual GPU ({vram_total:.1f} GB) detected: sharding across {num_gpus} GPUs.", flush=True)
-    else:
-        print(f"[LongWriter-Zero-32B] High-VRAM GPU ({vram_total:.1f} GB) detected: loading 100% into GPU VRAM.", flush=True)
+        load_kwargs["max_memory"] = {0: "13.5GiB", "cpu": "40GiB"}
+        print("[LongWriter-Zero-32B] Single <22GB GPU detected: enabled safe GPU+CPU offload.", flush=True)
 
     model = AutoModelForCausalLM.from_pretrained(resolved_id, **load_kwargs)
     _sanitize_model_generation_config(model, tokenizer)
