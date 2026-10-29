@@ -489,3 +489,4 @@ def run_longwriter_zero_benchmark(
             os.makedirs(os.environ["HF_HOME"], exist_ok=True)
 
     return save_model_result_csv(records, output_csv)
+

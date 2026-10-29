@@ -176,3 +176,4 @@ class QwenAgentBackend:
 
         in_len = inputs["input_ids"].shape[1]
         return self.tokenizer.decode(outputs[0][in_len:], skip_special_tokens=True)
+

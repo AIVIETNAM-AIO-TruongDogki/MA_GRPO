@@ -217,3 +217,4 @@ def run_self_lengthen_benchmark(
         backend.unload()
 
     return save_model_result_csv(records, output_csv)
+

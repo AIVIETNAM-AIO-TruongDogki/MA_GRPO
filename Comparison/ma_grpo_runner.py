@@ -183,3 +183,4 @@ def run_ma_grpo_checkpoint_benchmark(
         clean_gpu_memory()
 
     return save_model_result_csv(records, output_csv)
+
