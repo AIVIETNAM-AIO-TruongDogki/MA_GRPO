@@ -33,7 +33,14 @@ def _total_gpu_vram_gb() -> float:
 
 
 def _apply_chatglm_patches():
-    """Apply all critical patches so THUDM/LongWriter-glm4-9b runs cleanly on transformers >= 4.45."""
+    """Apply all critical patches so THUDM/LongWriter-glm4-9b runs cleanly on transformers >= 4.45 / 5.x."""
+    try:
+        from transformers.configuration_utils import PretrainedConfig
+
+        PretrainedConfig._get_generation_parameters = lambda self, *args, **kwargs: {}
+    except Exception:
+        pass
+
     try:
         import transformers.modeling_utils
 
@@ -66,7 +73,15 @@ def _apply_chatglm_patches():
     try:
         from transformers.cache_utils import DynamicCache
 
-        DynamicCache.__getitem__ = lambda self, idx: (self.key_cache[idx], self.value_cache[idx])
+        def _safe_cache_getitem(self, idx):
+            if hasattr(self, "key_cache") and hasattr(self, "value_cache"):
+                return (self.key_cache[idx], self.value_cache[idx])
+            if hasattr(self, "layers") and idx < len(self.layers):
+                layer = self.layers[idx]
+                return (getattr(layer, "keys", None), getattr(layer, "values", None))
+            raise IndexError(idx)
+
+        DynamicCache.__getitem__ = _safe_cache_getitem
     except Exception:
         pass
 
@@ -78,6 +93,34 @@ def _apply_chatglm_patches():
             return "past_key_values", past
 
         GenerationMixin._extract_past_from_model_output = _extract_past_from_model_output
+    except Exception:
+        pass
+
+
+def _sanitize_model_generation_config(model, tokenizer):
+    """Remove legacy generation parameters (e.g. max_length=1048576) from model.config & class."""
+    cls = type(model.config)
+    for target_obj in (cls, model.config):
+        if hasattr(target_obj, "max_length"):
+            try:
+                delattr(target_obj, "max_length")
+            except Exception:
+                pass
+        try:
+            target_obj._get_generation_parameters = lambda *args, **kwargs: {}
+        except Exception:
+            pass
+    try:
+        model.config.__dict__.pop("max_length", None)
+    except Exception:
+        pass
+
+    try:
+        gen_conf = GenerationConfig.from_model_config(model.config)
+        gen_conf.max_length = None
+        gen_conf.pad_token_id = tokenizer.pad_token_id
+        gen_conf.eos_token_id = tokenizer.eos_token_id
+        model.generation_config = gen_conf
     except Exception:
         pass
 
@@ -131,6 +174,7 @@ def run_longwriter_llama_benchmark(
         load_kwargs["quantization_config"] = quant_config
 
     model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+    _sanitize_model_generation_config(model, tokenizer)
     model.eval()
     print(f"[LongWriter-llama3.1-8b] Loaded successfully! (Total GPU VRAM: {vram_total:.1f} GB)", flush=True)
 
@@ -255,17 +299,52 @@ def run_longwriter_glm_benchmark(
     model = AutoModelForCausalLM.from_pretrained(resolved_id, **load_kwargs)
     if not hasattr(model, "all_tied_weights_keys") or getattr(model, "all_tied_weights_keys", None) is None:
         model.all_tied_weights_keys = {}
-    if hasattr(model.config, "max_length"):
-        try:
-            delattr(model.config, "max_length")
-        except Exception:
-            pass
-    try:
-        gen_conf = GenerationConfig.from_model_config(model.config)
-        gen_conf.max_length = None
-        model.generation_config = gen_conf
-    except Exception:
-        pass
+
+    # Patch ChatGLM model class methods for transformers >= 4.45 / 5.x compatibility
+    model_cls = type(model)
+
+    def _extract_past_from_model_output(self, outputs, standardize_cache_format=False):
+        past = getattr(outputs, "past_key_values", None)
+        return "past_key_values", past
+
+    model_cls._extract_past_from_model_output = _extract_past_from_model_output
+    model_cls._prepare_cache_for_generation = lambda self, *args, **kwargs: None
+
+    if hasattr(model_cls, "_update_model_kwargs_for_generation"):
+        orig_update_kwargs = model_cls._update_model_kwargs_for_generation
+
+        def _safe_update_model_kwargs_for_generation(
+            self, outputs, model_kwargs, is_encoder_decoder=False, standardize_cache_format=False, **kwargs
+        ):
+            return orig_update_kwargs(
+                self,
+                outputs,
+                model_kwargs,
+                is_encoder_decoder=is_encoder_decoder,
+                standardize_cache_format=standardize_cache_format,
+            )
+
+        model_cls._update_model_kwargs_for_generation = _safe_update_model_kwargs_for_generation
+
+    if hasattr(model_cls, "prepare_inputs_for_generation"):
+        orig_prep_inputs = model_cls.prepare_inputs_for_generation
+
+        def _safe_prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+            if past_key_values is not None:
+                try:
+                    if len(past_key_values) == 0 or (
+                        hasattr(past_key_values, "get_seq_length") and past_key_values.get_seq_length() == 0
+                    ):
+                        past_key_values = None
+                    elif isinstance(past_key_values, (tuple, list)) and past_key_values[0] is None:
+                        past_key_values = None
+                except Exception:
+                    past_key_values = None
+            return orig_prep_inputs(self, input_ids, past_key_values=past_key_values, **kwargs)
+
+        model_cls.prepare_inputs_for_generation = _safe_prepare_inputs_for_generation
+
+    _sanitize_model_generation_config(model, tokenizer)
 
     model.eval()
     print(f"[LongWriter-glm4-9b] Loaded {resolved_id} successfully!", flush=True)
@@ -415,11 +494,7 @@ def run_longwriter_zero_benchmark(
         print(f"[LongWriter-Zero-32B] High-VRAM GPU ({vram_total:.1f} GB) detected: loading 100% into GPU VRAM.", flush=True)
 
     model = AutoModelForCausalLM.from_pretrained(resolved_id, **load_kwargs)
-    if hasattr(model.config, "max_length"):
-        try:
-            delattr(model.config, "max_length")
-        except Exception:
-            pass
+    _sanitize_model_generation_config(model, tokenizer)
     model.eval()
     print(f"[LongWriter-Zero-32B] Loaded {resolved_id} successfully!", flush=True)
 
