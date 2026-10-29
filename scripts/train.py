@@ -244,15 +244,29 @@ def main() -> None:
     )
     model.print_trainable_parameters()
 
-    group_size = args.group_size or int(rollout_cfg.get("group_size", 8))
+    group_size = args.group_size or int(rollout_cfg.get("group_size", 4))
     max_tokens = args.max_completion_tokens or int(rollout_cfg.get("max_tokens", 1500))
     output_dir = str(args.output_dir)
+
+    grad_accum = args.gradient_accumulation or int(train_cfg.get("gradient_accumulation_steps", 4))
+    if (args.batch_size * grad_accum) % group_size != 0:
+        target_accum = max(1, group_size // max(1, args.batch_size))
+        LOG.warning(
+            "TRL GRPO requires (batch_size * gradient_accumulation) to be divisible by num_generations. "
+            "Auto-adjusting gradient_accumulation_steps from %d to %d (group_size=%d, batch_size=%d).",
+            grad_accum,
+            target_accum,
+            group_size,
+            args.batch_size,
+        )
+        grad_accum = target_accum
+
     grpo_values = {
         "output_dir": output_dir,
         "learning_rate": float(train_cfg.get("learning_rate", 5e-6)),
         "max_steps": args.max_steps if args.max_steps is not None else int(train_cfg.get("max_steps", 500)),
         "per_device_train_batch_size": args.batch_size,
-        "gradient_accumulation_steps": args.gradient_accumulation or int(train_cfg.get("gradient_accumulation_steps", 2)),
+        "gradient_accumulation_steps": grad_accum,
         "logging_steps": int(train_cfg.get("logging_steps", 5)),
         "save_steps": int(train_cfg.get("save_steps", 50)),
         "num_generations": group_size,
