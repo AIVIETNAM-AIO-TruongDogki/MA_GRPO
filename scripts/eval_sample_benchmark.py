@@ -143,7 +143,7 @@ def run_benchmark(
     checkpoint_dir: str,
     base_model_name: str = "Qwen/Qwen2.5-7B-Instruct",
     num_samples: int = 3,
-    dataset_path: str = str(DEFAULT_DATASET),
+    dataset_path: str = None,
     output_csv: str = "benchmark_comparison_results.csv",
 ):
     print("=" * 80)
