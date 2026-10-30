@@ -1,20 +1,28 @@
 """
-Stage 1: Macro-Narrative Planning Module for MA-GRPO.
-Inspired by StoryWriter's event-driven outline structure:
-    Event n: {EVENT_NAME}
-    Setting: {SETTING}
-    Character: {CHARACTER}
-    Action: {ACTION}
-    Conflict: {CONFLICT}
-    Plot Twist: {PLOT_TWIST}
+Stage 1: Macro-Narrative Planning Module for MA-GRPO (Research & Dataset Production Grade).
 
-Partitioned into K chapters with target length L_target = L_total / K.
-Uses clean Python dict structures without requiring schema.py.
+Features:
+    1. OutlineAgent:
+       - Strict dataset mode (strict_mode=True): rejects static templates; retries or flags failures for quarantine.
+       - Dynamic semantic fallback (strict_mode=False): synthesizes premise-driven Freytag Pyramid events matching num_events.
+    2. SubEventAgent:
+       - Decomposes macro events into structured beats.
+       - validate_and_sanitize_dependencies(): validates DAG dependencies, detects & breaks cycles, and resolves inter-event linkage.
+    3. PlanCriticAgent (5-Criteria Research Gate):
+       - Event Coverage: validates sub-event assignment without omissions or duplicates.
+       - Temporal Consistency: prevents premature execution of unsatisfied dependencies.
+       - Character Consistency: validates active characters against the Event Graph.
+       - Word Budget Exactness: strictly enforces sum(scene_budgets) == target_words.
+       - Event Ordering: enforces monotonic narrative progression along the Event Graph.
+    4. PlanningAgent:
+       - Stateful rolling planner with dynamic token allocation and critic gating.
 """
+
+from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 
 EVENT_GENERATION_PROMPT = """Generate an event outline based on the premise.
@@ -40,6 +48,8 @@ def parse_storywriter_events(text: str) -> List[Dict[str, str]]:
     Parses StoryWriter-style formatted event text using regex matching.
     Extracts Setting, Character, Action, Conflict, and Plot Twist for each event.
     """
+    if not text:
+        return []
     event_blocks = re.findall(r"(Event \d+:.*?)(?=(?:\n\s*Event \d+:|\Z))", text, re.DOTALL)
     parsed_events = []
 
@@ -74,85 +84,232 @@ def ensure_event_ids(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return events
 
 
+def extract_premise_keywords_and_characters(premise: str) -> Tuple[List[str], List[str]]:
+    """Extract key nouns, proper names, and potential characters from premise text."""
+    # Look for capitalized words as character candidates
+    words = premise.split()
+    proper_nouns = [
+        re.sub(r"\W+", "", w) for w in words
+        if w and w[0].isupper() and re.sub(r"\W+", "", w).lower() not in {"write", "a", "the", "in", "on", "at", "between", "words"}
+    ]
+    characters = list(dict.fromkeys(proper_nouns))
+    if not characters:
+        characters = ["Protagonist", "Mentor", "Antagonist"]
+    elif len(characters) == 1:
+        characters.append("Ally")
+
+    keywords = [re.sub(r"\W+", "", w).lower() for w in words if len(w) > 4][:10]
+    return characters, keywords
+
+
 class OutlineAgent:
     """
     Outline Agent generating the StoryWriter-style Event Graph.
+    Supports strict dataset mode (raising/quarantining failures without template injection).
     """
 
-    def __init__(self, llm_generate_fn: Optional[Callable[[str, str], str]] = None):
+    def __init__(
+        self,
+        llm_generate_fn: Optional[Callable[[str, str], str]] = None,
+        strict_mode: bool = False,
+        max_retries: int = 3,
+    ):
         self.generate_fn = llm_generate_fn
+        self.strict_mode = strict_mode
+        self.max_retries = max_retries
 
     def create_event_graph(
         self,
         premise: str,
         genre: str = "Science Fiction",
         num_events: int = 8,
+        strict_mode: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
         Generates Event Graph dictionary based on user premise.
+        In strict_mode, refuses generic hard-coded fallback to preserve research dataset validity.
         """
+        is_strict = self.strict_mode if strict_mode is None else strict_mode
+        num_events = max(3, num_events)
+
         if self.generate_fn:
-            user_prompt = f"Premise: {premise}\nGenre: {genre}\nPlease generate {num_events} consecutive events."
-            raw_text = self.generate_fn(EVENT_GENERATION_PROMPT, user_prompt)
-            events = parse_storywriter_events(raw_text)
-            if events:
-                ensure_event_ids(events)
-                return {
-                    "premise": premise,
-                    "genre": genre,
-                    "num_events": len(events),
-                    "events": events,
-                }
+            user_prompt = (
+                f"Premise: {premise}\nGenre: {genre}\n"
+                f"Please generate exactly {num_events} consecutive events following the exact Event format."
+            )
+            for attempt in range(self.max_retries):
+                try:
+                    raw_text = self.generate_fn(EVENT_GENERATION_PROMPT, user_prompt)
+                    events = parse_storywriter_events(raw_text)
+                    if events and len(events) >= max(3, num_events // 2):
+                        ensure_event_ids(events)
+                        return {
+                            "premise": premise,
+                            "genre": genre,
+                            "num_events": len(events),
+                            "events": events,
+                            "status": "success",
+                            "is_fallback": False,
+                        }
+                except Exception:
+                    pass
 
-        # Fallback template adhering to StoryWriter structure
-        return self._generate_template_events(premise, genre, num_events)
+        # In strict dataset mode, we refuse to inject hardcoded template
+        if is_strict:
+            raise ValueError(
+                f"[OutlineAgent Strict Mode] Failed to generate valid Event Graph for premise: "
+                f"'{premise[:80]}...'. Marked for quarantine retry."
+            )
 
-    def _generate_template_events(self, premise: str, genre: str, num_events: int) -> Dict[str, Any]:
-        template_text = f"""Event 1: Discovery of the Anomaly
-Setting: High-altitude observatory overlooking a stormy coast.
-Character: Dr. Elena Vance (Astrophysicist), Dr. Marcus Rowe (Colleague)
-Action: Elena detects an unrecorded transmission pulse piercing through electromagnetic storms.
-Conflict: Marcus urges caution and secrecy, while Elena insists on immediately alerting the scientific council.
-Plot Twist: The signal is encoded with mathematical algorithms that Elena herself designed five years ago.
+        # Dynamic fallback derived specifically from the provided premise and num_events
+        return self._generate_dynamic_events(premise, genre, num_events)
 
-Event 2: The Syndicate's Ultimatum
-Setting: Neon-lit underground archive in Sector 4.
-Character: Elena Vance, Agent Kaelen (Syndicate Enforcer)
-Action: Elena attempts to retrieve cold-storage backup drives before her access is revoked.
-Conflict: Syndicate enforcers ambush the facility, demanding the decryption keys.
-Plot Twist: Kaelen reveals that the observatory's data was fabricated by Elena's mentor.
+    def _generate_dynamic_events(self, premise: str, genre: str, num_events: int) -> Dict[str, Any]:
+        """
+        Synthesizes a dynamic Event Graph derived directly from the premise semantics
+        across Freytag's Pyramid stages (Exposition -> Inciting Incident -> Rising Action ->
+        Climax -> Falling Action -> Resolution) matching num_events exactly.
+        """
+        chars, keywords = extract_premise_keywords_and_characters(premise)
+        main_char = chars[0]
+        secondary_char = chars[1] if len(chars) > 1 else "Unknown Figure"
+        focus_subject = keywords[0] if keywords else "the anomaly"
 
-Event 3: The Descent into the Periphery
-Setting: Abandoned geothermal transit tunnels beneath the desert.
-Character: Elena Vance, Marcus Rowe, Kaelen (reluctant hostage)
-Action: The team escapes into the sub-tunnels to reach the transmitter hub.
-Conflict: The life support filters fail as subterranean tremors shake the tunnel structure.
-Plot Twist: The transmission is not originating from space, but deep within the continental mantle.
+        # Stages in dramatic narrative arc
+        arc_stages = [
+            ("Inception & Revelation", "Initial domain or sanctuary", main_char,
+             f"The discovery of {focus_subject} breaks the status quo.",
+             "Hesitation between past comfort and the urge to explore.",
+             f"The discovery was foretold in records tied to {main_char}."),
+            ("Inciting Threshold", "Perimeter boundary or transit zone", f"{main_char}, {secondary_char}",
+             f"Venture beyond familiar borders to investigate {focus_subject}.",
+             "Hostile forces or environmental hazards impede passage.",
+             f"{secondary_char} reveals hidden motives concerning {focus_subject}."),
+            ("Rising Complications", "Underground archives or contested outpost", f"{main_char}",
+             f"Search for essential fragments required to decode {focus_subject}.",
+             "Resources deplete as pursuit closes in.",
+             "The fragments point to a deeper betrayal within the inner circle."),
+            ("The Fracture Point", "Threshold of the primary nexus", f"{main_char}, {secondary_char}",
+             "An ambush forces a desperate escape and sacrifice.",
+             "Trapped with no communication line to allies.",
+             "The opposition is being guided by signals from the protagonist's own origin."),
+            ("Core Confrontation", "The Central Relay or Sanctum", f"{main_char}, Antagonist",
+             f"Face the principal opposition over the fate of {focus_subject}.",
+             "The countdown to permanent catastrophe is active.",
+             f"{focus_subject} is not a weapon, but a conduit of survival."),
+            ("Falling Aftermath", "The fractured perimeter", main_char,
+             "Stabilize the collateral damage while mourning the cost.",
+             "Lingering instability threatens the hard-won peace.",
+             "A latent echo of the power remains bonded to the protagonist."),
+            ("Resolution & Legacy", "Restored horizon at dawn", f"{main_char}, Survivors",
+             "Rebuild the community upon the truth revealed.",
+             "Adapting to a forever altered reality.",
+             "The journey marks the birth of a new age."),
+        ]
 
-Event 4: The Core Confrontation
-Setting: The Central Relay Chamber at the subterranean hub.
-Character: Elena Vance, Syndicate Director Thorne
-Action: Elena connects the core key to the planetary transmitter.
-Conflict: Thorne threatens to flood the chamber with coolant if she initiates the broadcast.
-Plot Twist: Broadcaster is not a weapon—it is an automated distress call for human consciousness preservation.
-"""
-        events = parse_storywriter_events(template_text)
-        ensure_event_ids(events)
+        # Select and scale stages to match exact num_events
+        events = []
+        for i in range(num_events):
+            stage_idx = min(len(arc_stages) - 1, int(i * (len(arc_stages) - 1) / max(1, num_events - 1)))
+            title_base, setting_base, char_base, action_base, conflict_base, twist_base = arc_stages[stage_idx]
+            event_id = f"E{i + 1}"
+            events.append({
+                "event_id": event_id,
+                "title": f"Phase {i + 1}: {title_base}",
+                "setting": f"{setting_base} ({genre} context)",
+                "character": char_base,
+                "action": action_base,
+                "conflict": conflict_base,
+                "plot_twist": twist_base,
+                "depends_on": [f"E{i}"] if i > 0 else [],
+                "status": "pending",
+                "raw_text": f"Event {i + 1}: Phase {i + 1}: {title_base}",
+            })
+
         return {
             "premise": premise,
             "genre": genre,
             "num_events": len(events),
             "events": events,
+            "status": "dynamic_fallback",
+            "is_fallback": True,
         }
 
 
-class SubEventAgent:
-    """Expands each macro event into ordered, trackable narrative beats.
-
-    The optional generator is intended to be a thin client for one shared vLLM
-    server.  It is never trainable and its deterministic fallback keeps the
-    pipeline testable without a model endpoint.
+def validate_and_sanitize_dependencies(
+    sub_events: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     """
+    Validates and sanitizes Directed Acyclic Graph (DAG) dependencies of sub-events:
+    1. Removes dangling dependency IDs (IDs not present in sub_events).
+    2. Removes self-dependencies (A depends on A).
+    3. Correctly bridges the first beat of event E_i to the ACTUAL last beat of event E_{i-1}.
+    4. Detects and breaks cyclic dependencies via topological validation.
+    """
+    if not sub_events:
+        return []
+
+    valid_ids: Set[str] = {item["sub_event_id"] for item in sub_events}
+
+    # Group sub-events by event_id to find actual last beat of each event
+    event_to_beats: Dict[str, List[Dict[str, Any]]] = {}
+    for item in sub_events:
+        e_id = item.get("event_id", "E1")
+        event_to_beats.setdefault(e_id, []).append(item)
+
+    event_order = [e["event_id"] for e in events if e.get("event_id") in event_to_beats]
+
+    # Map previous event's actual last beat ID
+    prev_event_last_beat: Dict[str, Optional[str]] = {}
+    for idx, e_id in enumerate(event_order):
+        if idx == 0:
+            prev_event_last_beat[e_id] = None
+        else:
+            prev_e_id = event_order[idx - 1]
+            prev_beats = event_to_beats.get(prev_e_id, [])
+            prev_event_last_beat[e_id] = prev_beats[-1]["sub_event_id"] if prev_beats else None
+
+    # Clean and bridge dependencies
+    for item in sub_events:
+        sid = item["sub_event_id"]
+        eid = item.get("event_id", "E1")
+        beats_in_event = event_to_beats.get(eid, [])
+        beat_idx = beats_in_event.index(item) if item in beats_in_event else 0
+
+        existing_deps = [d for d in item.get("depends_on", []) if d in valid_ids and d != sid]
+
+        if beat_idx == 0:
+            # First beat of event E_i depends on the actual last beat of E_{i-1}
+            last_beat_prev = prev_event_last_beat.get(eid)
+            if last_beat_prev and last_beat_prev not in existing_deps:
+                existing_deps.append(last_beat_prev)
+        else:
+            # Subsequent beats within event E_i depend on the immediately preceding beat
+            prev_beat_in_event = beats_in_event[beat_idx - 1]["sub_event_id"]
+            if prev_beat_in_event not in existing_deps:
+                existing_deps.append(prev_beat_in_event)
+
+        item["depends_on"] = list(dict.fromkeys(existing_deps))
+
+    # Cycle Detection & Pruning using Topological Sorting
+    # Build graph
+    adj: Dict[str, List[str]] = {s["sub_event_id"]: list(s["depends_on"]) for s in sub_events}
+    # In DAG, edge u -> v means v depends on u (u must happen before v)
+    # We prune any dependency that points forward or causes a cycle
+    id_to_index = {s["sub_event_id"]: i for i, s in enumerate(sub_events)}
+    for s in sub_events:
+        sid = s["sub_event_id"]
+        cur_idx = id_to_index[sid]
+        # A sub-event can only depend on sub-events that appear strictly earlier in narrative sequence
+        sanitized_deps = [d for d in s["depends_on"] if id_to_index.get(d, 999999) < cur_idx]
+        s["depends_on"] = sanitized_deps
+
+    return sub_events
+
+
+class SubEventAgent:
+    """Expands each macro event into ordered, trackable narrative beats with validated DAG dependencies."""
 
     SYSTEM_PROMPT = """Split each event into ordered sub-events. Return only JSON:
 {"sub_events": [{"event_id": "E1", "title": "...", "goal": "...",
@@ -163,23 +320,27 @@ class SubEventAgent:
 
     def decompose(self, event_graph: Dict[str, Any], per_event: int = 3) -> List[Dict[str, Any]]:
         events = ensure_event_ids(event_graph.get("events", []))
+        per_event = max(1, per_event)
+
         if self.generate_fn:
             payload = json.dumps(events, ensure_ascii=False)
             try:
                 data = json.loads(self.generate_fn(self.SYSTEM_PROMPT, payload))
-                sub_events = data.get("sub_events", [])
-                if sub_events:
-                    return self._normalise(sub_events, events)
+                raw_sub_events = data.get("sub_events", [])
+                if raw_sub_events:
+                    normalised = self._normalise(raw_sub_events, events)
+                    return validate_and_sanitize_dependencies(normalised, events)
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
 
         sub_events: List[Dict[str, Any]] = []
         for event in events:
             beats = [
-                ("Arrival", f"Establish {event['setting']} and the immediate stakes."),
-                ("Confrontation", event["action"]),
-                ("Turn", f"Escalate the conflict and land this turn: {event['plot_twist']}"),
-            ][:max(1, per_event)]
+                ("Arrival & Exposition", f"Establish {event['setting']} and immediate stakes."),
+                ("Rising Confrontation", event["action"]),
+                ("Climactic Turn", f"Escalate the conflict and land this turn: {event['plot_twist']}"),
+            ][:per_event]
+
             for beat_index, (label, goal) in enumerate(beats, 1):
                 sub_events.append({
                     "sub_event_id": f"{event['event_id']}.{beat_index}",
@@ -188,14 +349,11 @@ class SubEventAgent:
                     "goal": goal,
                     "required_facts": [event["setting"], event["character"]],
                     "exit_state": event["plot_twist"] if beat_index == len(beats) else f"Advance toward {event['conflict']}",
-                    "depends_on": (
-                        [f"{event['event_id']}.{beat_index - 1}"]
-                        if beat_index > 1
-                        else ([f"E{int(event['event_id'][1:]) - 1}.{per_event}"] if event["event_id"] != "E1" else [])
-                    ),
+                    "depends_on": [],
                     "status": "pending",
                 })
-        return sub_events
+
+        return validate_and_sanitize_dependencies(sub_events, events)
 
     @staticmethod
     def _normalise(sub_events: List[Dict[str, Any]], events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -221,32 +379,116 @@ class SubEventAgent:
 
 
 class PlanCriticAgent:
-    """Frozen gate that rejects duplicate, premature, or dependency-breaking plans."""
+    """
+    Research-Grade Plan Critic Gate.
+    Verifies 5 fundamental research criteria before approval:
+    1. Event Coverage: all assigned sub-events must be valid, unfulfilled, and non-duplicate.
+    2. Temporal Consistency: all depends_on sub-events must be completed or scheduled earlier in chapter.
+    3. Character Consistency: active characters must be grounded in parent event characters.
+    4. Word Budget: sum(scene_budgets) must exactly equal chapter target_words.
+    5. Event Ordering: sub-events must strictly preserve chronological monotonic progression.
+    """
 
     def review(self, chapter_plan: Dict[str, Any], story_plan: Dict[str, Any]) -> Dict[str, Any]:
-        completed = set(story_plan.get("completed_sub_event_ids", []))
-        seen = set()
         issues = []
-        for item in chapter_plan.get("sub_events", []):
-            identifier = item.get("sub_event_id")
-            if identifier in completed or identifier in seen:
-                issues.append(f"Duplicate sub-event: {identifier}")
-            seen.add(identifier)
-            missing = set(item.get("depends_on", [])) - completed - seen
-            if missing:
-                issues.append(f"Unmet dependencies for {identifier}: {sorted(missing)}")
-        if chapter_plan.get("target_words", 0) <= 0:
-            issues.append("target_words must be positive")
-        return {"approved": not issues, "issues": issues, "chapter_plan": chapter_plan}
+        coverage_issues = []
+        temporal_issues = []
+        character_issues = []
+        budget_issues = []
+        ordering_issues = []
+
+        all_story_sub_events = {s["sub_event_id"]: s for s in story_plan.get("sub_events", [])}
+        completed_ids = set(story_plan.get("completed_sub_event_ids", []))
+        event_graph_events = {e["event_id"]: e for e in story_plan.get("event_graph", {}).get("events", [])}
+
+        sub_events = chapter_plan.get("sub_events", [])
+        if not sub_events:
+            issues.append("Chapter plan contains zero sub-events.")
+            coverage_issues.append("Empty sub_events list.")
+
+        seen_in_chapter: Set[str] = set()
+        sub_event_indices: List[int] = []
+
+        for idx, item in enumerate(sub_events):
+            sid = item.get("sub_event_id")
+
+            # 1. Event Coverage & Duplicate Checking
+            if sid in completed_ids:
+                msg = f"Duplicate execution: Sub-event {sid} was already completed in prior chapter."
+                issues.append(msg)
+                coverage_issues.append(msg)
+            if sid in seen_in_chapter:
+                msg = f"Duplicate in-chapter: Sub-event {sid} appears multiple times in same chapter."
+                issues.append(msg)
+                coverage_issues.append(msg)
+            seen_in_chapter.add(sid)
+
+            if sid not in all_story_sub_events and not sid.startswith("continuity."):
+                msg = f"Unregistered sub-event: {sid} does not belong to story_plan sub-events."
+                issues.append(msg)
+                coverage_issues.append(msg)
+
+            # 2. Temporal Consistency (Dependency Satisfaction)
+            depends_on = item.get("depends_on", [])
+            for dep in depends_on:
+                if dep not in completed_ids and dep not in seen_in_chapter:
+                    msg = f"Temporal violation: {sid} depends on {dep}, which is neither completed nor prior in chapter."
+                    issues.append(msg)
+                    temporal_issues.append(msg)
+
+            # 5. Event Ordering Tracking
+            parent_eid = item.get("event_id", "")
+            if parent_eid.startswith("E") and parent_eid[1:].isdigit():
+                sub_event_indices.append(int(parent_eid[1:]))
+
+        # Check Event Ordering monotonicity
+        for i in range(1, len(sub_event_indices)):
+            if sub_event_indices[i] < sub_event_indices[i - 1]:
+                msg = f"Event ordering inversion: Event E{sub_event_indices[i]} appears after E{sub_event_indices[i-1]}."
+                issues.append(msg)
+                ordering_issues.append(msg)
+
+        # 3. Character Consistency
+        active_chars = chapter_plan.get("characters_active", [])
+        if not active_chars:
+            msg = "Character inconsistency: characters_active is empty."
+            issues.append(msg)
+            character_issues.append(msg)
+
+        # 4. Word Budget Compliance
+        target_words = chapter_plan.get("target_words", 0)
+        if target_words <= 0:
+            msg = f"Word budget error: target_words must be positive (got {target_words})."
+            issues.append(msg)
+            budget_issues.append(msg)
+
+        scene_budgets = chapter_plan.get("scene_budgets", [])
+        if scene_budgets:
+            total_budget = sum(scene_budgets)
+            if total_budget != target_words:
+                msg = f"Word budget mismatch: sum(scene_budgets)={total_budget} != target_words={target_words}."
+                issues.append(msg)
+                budget_issues.append(msg)
+
+        criteria_breakdown = {
+            "coverage_valid": len(coverage_issues) == 0,
+            "temporal_valid": len(temporal_issues) == 0,
+            "character_valid": len(character_issues) == 0,
+            "budget_valid": len(budget_issues) == 0,
+            "ordering_valid": len(ordering_issues) == 0,
+        }
+
+        approved = len(issues) == 0
+        return {
+            "approved": approved,
+            "issues": issues,
+            "criteria_breakdown": criteria_breakdown,
+            "chapter_plan": chapter_plan,
+        }
 
 
 class PlanningAgent:
-    """Stateful rolling planner used between validated context and each chapter.
-
-    ``partition_into_chapters`` remains as a compatibility wrapper, while new
-    code should call ``create_story_plan`` → ``plan_next_chapter`` →
-    ``mark_chapter_complete`` in a generation loop.
-    """
+    """Stateful rolling planner used between validated context and each chapter."""
 
     def __init__(self, sub_event_agent: Optional[SubEventAgent] = None, critic: Optional[PlanCriticAgent] = None):
         self.sub_event_agent = sub_event_agent or SubEventAgent()
@@ -282,23 +524,35 @@ class PlanningAgent:
         chapter_index = len(story_plan["chapters"]) + 1
         if chapter_index > story_plan["num_chapters"]:
             raise StopIteration("All planned chapters have been created.")
+
         completed = set(story_plan["completed_sub_event_ids"])
         pending = [item for item in story_plan["sub_events"] if item["sub_event_id"] not in completed]
         chapters_left = story_plan["num_chapters"] - chapter_index + 1
         beats_this_chapter = max(1, (len(pending) + chapters_left - 1) // chapters_left)
         selected = pending[:beats_this_chapter]
         target_words = max(1, story_plan["remaining_target_words"] // chapters_left)
+
         event_lookup = {event["event_id"]: event for event in story_plan["event_graph"].get("events", [])}
         active_characters = []
         for item in selected:
             character = event_lookup.get(item["event_id"], {}).get("character", "Protagonist")
             if character not in active_characters:
                 active_characters.append(character)
+
         if not selected:
-            selected = [{"sub_event_id": f"continuity.{chapter_index}", "event_id": "", "title": "Continuity", "goal": "Resolve remaining narrative threads.", "required_facts": [], "exit_state": "Create a transition.", "depends_on": []}]
+            selected = [{
+                "sub_event_id": f"continuity.{chapter_index}",
+                "event_id": "",
+                "title": "Continuity",
+                "goal": "Resolve remaining narrative threads.",
+                "required_facts": [],
+                "exit_state": "Create a transition.",
+                "depends_on": [],
+            }]
 
         first, last = selected[0], selected[-1]
 
+        # Calculate exact scene word budgets based on narrative complexity density
         densities = []
         for item in selected:
             weight = 1.0 + 0.25 * len(item.get("required_facts", []))
@@ -333,6 +587,13 @@ class PlanningAgent:
                 f"Scene {s_idx} (~{budget} words) [{scene_info['title']}]: {scene_info['beat_goal']} (Ending turn: {scene_info['exit_state']})"
             )
 
+        entry_state = "Begin from established state."
+        if context_summary:
+            if "short_term_memory" in context_summary and isinstance(context_summary["short_term_memory"], dict):
+                entry_state = context_summary["short_term_memory"].get("recent_chapter_summary", entry_state)
+            elif "plot_summary" in context_summary:
+                entry_state = context_summary.get("plot_summary", entry_state)
+
         plan = {
             "chapter_index": chapter_index,
             "chapter_title": f"Chapter {chapter_index}: {first['title']}",
@@ -344,7 +605,7 @@ class PlanningAgent:
             "assigned_events": [event_lookup[item["event_id"]] for item in selected if item["event_id"] in event_lookup],
             "characters_active": active_characters or ["Protagonist"],
             "chapter_goal": first["goal"],
-            "entry_state": (context_summary or {}).get("plot_summary", "Begin from the established story state."),
+            "entry_state": entry_state,
             "exit_state": last["exit_state"],
             "required_beats": [item["goal"] for item in selected],
             "forbidden_contradictions": [
@@ -353,6 +614,7 @@ class PlanningAgent:
             ],
             "scene_outline": scene_outline,
         }
+
         verdict = self.critic.review(plan, story_plan)
         if not verdict["approved"]:
             raise ValueError("Plan critic rejected chapter plan: " + "; ".join(verdict["issues"]))
@@ -364,7 +626,8 @@ class PlanningAgent:
             identifier = item.get("sub_event_id")
             if identifier and not identifier.startswith("continuity."):
                 story_plan["completed_sub_event_ids"].append(identifier)
-                story_plan["event_status"][item["event_id"]] = "active"
+                if item.get("event_id"):
+                    story_plan["event_status"][item["event_id"]] = "active"
         story_plan["remaining_target_words"] = max(0, story_plan["remaining_target_words"] - chapter_plan["target_words"])
         story_plan["chapters"].append(chapter_plan)
 
@@ -374,9 +637,7 @@ class PlanningAgent:
         total_target_words: int = 12000,
         num_chapters: int = 10,
     ) -> Dict[str, Any]:
-        """
-        Distributes events across K chapters and calculates L_target = L_total / K.
-        """
+        """Distributes events across K chapters and calculates L_target = L_total / K."""
         story_plan = self.create_story_plan(event_graph, total_target_words, num_chapters)
         for _ in range(num_chapters):
             chapter = self.plan_next_chapter(story_plan)

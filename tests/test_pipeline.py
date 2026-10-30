@@ -7,7 +7,12 @@ Verifies:
     4. End-to-End story generation simulation
 """
 
+import sys
 import unittest
+from pathlib import Path
+
+# Add project root to sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.coordinator import ContextGateValidator, CoordinatorAgent
 from src.pipeline import VLLMWritingPolicy, MAGRPOPipeline
