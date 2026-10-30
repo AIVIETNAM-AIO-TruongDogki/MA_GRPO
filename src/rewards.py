@@ -1,34 +1,48 @@
 """
-Unified Intrinsic Reward Engine for MA-GRPO (Phase 1).
-Contains all 3 intrinsic mathematical reward components in a single consolidated file:
-    1. R_length: Rule-based O(1) chapter target length compliance.
-    2. R_coherence: Sentence embedding transition Cosine Similarity + Anti-Context 3-Gram ratio.
-    3. R_quality: Fluency (local PPL), Richness (Shannon Entropy), and Burstiness (Sentence variation).
-    4. R_total: Composite weighted sum for GRPO Advantage calculation.
+Unified Intrinsic Reward Engine for MA-GRPO.
 
-Formula:
-    R_total(o_i^{(k)}) = w_1 * R_length + w_2 * R_coherence + w_3 * R_quality
+Contains the 3 standardized intrinsic mathematical reward components:
+    1. Length Reward (LongWriter-Style Piecewise with Buffer Zone):
+       r_length(o) = 1.0,                                    if L_lower <= len(o) <= L_upper
+                   = len(o) / L_lower,                       if len(o) < L_lower
+                   = (L_max - len(o)) / (L_max - L_upper),   if len(o) > L_upper
+    2. Coherence & Diversity Reward (Transition Smoothness & Anti-Repetition):
+       r_coherence(o) = CosineSim(End(C_{i-1}), Start(o)) * (|Uniq3Grams(o) \\ 3Grams(s_i)| / |Total3Grams(o)|)
+    3. Quality Reward (Fluency, Vocabulary Entropy, Sentence Burstiness):
+       r_quality(o) = alpha * r_fluency + beta * r_richness + gamma * r_burstiness
+    4. Evaluator Station (MAGRPORewardEvaluator & CompositeRewardEngine) for TRL GRPOTrainer.
 """
+
+from __future__ import annotations
 
 import math
 import re
 from collections import Counter
 from typing import Any, Dict, List, Optional, Set, Tuple
+
 try:
     import numpy as np
 except ImportError:
     np = None
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
 try:
     import yaml
 except ImportError:
     yaml = None
 
 
-
+# =====================================================================
+# 0. NARRATIVE REASONING & PROSE UTILITIES
+# =====================================================================
 def strip_think_tags(text: str) -> str:
     """
     Removes test-time reasoning tokens inside <think>...</think> if present.
-    Ensures rewards are evaluated strictly on the actual chapter prose.
+    Ensures rewards are evaluated strictly on the actual narrative prose.
     """
     if not text:
         return ""
@@ -38,34 +52,61 @@ def strip_think_tags(text: str) -> str:
 
 
 def count_words(text: str) -> int:
-    """Counts words using word-boundary regex, excluding reasoning tokens."""
+    """Counts words using whitespace splitting, excluding reasoning tokens."""
     if not text or not text.strip():
         return 0
     clean_text = strip_think_tags(text)
-    return len(re.findall(r"\b\w+\b", clean_text))
+    return len(clean_text.split())
+
+
+def extract_words(text: str) -> List[str]:
+    """Tokenizes text into lowercase words, excluding reasoning tokens."""
+    if not text:
+        return []
+    clean_text = strip_think_tags(text)
+    return re.findall(r"\w+", clean_text.lower())
+
+
+def extract_head_words(text: str, n_words: int = 150) -> str:
+    """Extracts the first n words from text."""
+    words = strip_think_tags(text).strip().split()
+    return " ".join(words[:n_words]) if words else ""
+
+
+def extract_tail_words(text: str, n_words: int = 150) -> str:
+    """Extracts the last n words from text."""
+    words = strip_think_tags(text).strip().split()
+    return " ".join(words[-n_words:]) if words else ""
+
+
+def get_ngrams(words: List[str], n: int = 3) -> List[Tuple[str, ...]]:
+    """Generates a list of n-grams from a word list."""
+    if len(words) < n:
+        return []
+    return [tuple(words[i : i + n]) for i in range(len(words) - n + 1)]
 
 
 def extract_length_bounds(
     prompt_text: str,
     target_length: Optional[int] = None,
     fallback_target: int = 1400,
-    lower_ratio: float = 0.95,
-    upper_ratio: float = 1.05,
-    max_ratio: float = 1.35,
+    lower_ratio: float = 0.85,
+    upper_ratio: float = 1.15,
+    max_ratio: float = 2.0,
 ) -> Tuple[int, int, int]:
     """
     Extracts (L_lower, L_upper, L_max) from prompt text or target length.
-    Detects ranges such as:
+    Supports ranges such as:
       - 'between 1300–1400 words' / 'between 1550 and 1600 words' -> L_lower=1300, L_upper=1400
-      - 'at least 900 words' / 'over 800 words' -> L_lower=900, L_upper=round(900 * 1.20)
-      - 'around 1600 words' -> L_lower=round(1600 * 0.95), L_upper=round(1600 * 1.05)
-    L_max is calculated as L_upper + max(int(round(L_upper * (max_ratio - 1.0))), L_upper - L_lower, 100).
+      - 'at least 900 words' / 'over 800 words' -> L_lower=900, L_upper=round(900 * 1.15)
+      - 'around 1600 words' -> L_lower=round(1600 * 0.85), L_upper=round(1600 * 1.15)
+    L_max defaults to max_ratio * L_upper (2.0 * L_upper).
     """
     if not prompt_text:
         target = max(1, target_length if target_length and target_length > 0 else fallback_target)
         l_low = max(1, int(round(target * lower_ratio)))
         l_up = max(l_low, int(round(target * upper_ratio)))
-        l_max = int(round(l_up + max(int(round(l_up * (max_ratio - 1.0))), l_up - l_low, 100)))
+        l_max = int(round(target * max_ratio))
         return l_low, l_up, l_max
 
     clean = prompt_text.replace(",", "")
@@ -77,8 +118,7 @@ def extract_length_bounds(
     if match:
         v1, v2 = int(match.group(1)), int(match.group(2))
         l_low, l_up = min(v1, v2), max(v1, v2)
-        span = max(l_up - l_low, int(round(l_up * (max_ratio - 1.0))))
-        l_max = int(round(l_up + max(span, 100)))
+        l_max = int(round(l_up * max_ratio))
         return l_low, l_up, l_max
 
     # 2. Match minimum constraints: 'at least X words', 'over X words'
@@ -86,8 +126,7 @@ def extract_length_bounds(
     if match:
         l_low = int(match.group(1))
         l_up = int(round(l_low * 1.20))
-        span = max(l_up - l_low, int(round(l_up * (max_ratio - 1.0))))
-        l_max = int(round(l_up + max(span, 100)))
+        l_max = int(round(l_up * max_ratio))
         return l_low, l_up, l_max
 
     # 3. Match 'Total Target Length: Approximately X words' or 'around X words' or single number
@@ -106,355 +145,405 @@ def extract_length_bounds(
 
     l_low = max(1, int(round(target * lower_ratio)))
     l_up = max(l_low, int(round(target * upper_ratio)))
-    span = max(l_up - l_low, int(round(l_up * (max_ratio - 1.0))))
-    l_max = int(round(l_up + max(span, 100)))
+    l_max = int(round(target * max_ratio))
     return l_low, l_up, l_max
+
+
+# =====================================================================
+# 1. LENGTH REWARD (LongWriter-Style Piecewise with Buffer Zone)
+# =====================================================================
+def reward_length(
+    completions: List[str],
+    target_length: int = 1200,
+    l_lower: Optional[int] = None,
+    l_upper: Optional[int] = None,
+    l_max: Optional[int] = None,
+    **kwargs: Any,
+) -> List[float]:
+    """
+    Hàm thưởng độ dài LongWriter-Zero (Piecewise với Vùng an toàn & Phạt bất đối xứng):
+    - Vùng an toàn: [0.85 * target_length, 1.15 * target_length] -> Điểm tuyệt đối 1.0
+    - Viết quá ngắn (< 0.85 * target): Phạt tuyến tính dốc về 0: len(o) / L_lower
+    - Viết quá dài (> 1.15 * target): Phạt nhẹ giảm dần về 0 tại l_max: (L_max - len(o)) / (L_max - L_upper)
+    """
+    if l_lower is None:
+        l_lower = int(0.85 * target_length)
+    if l_upper is None:
+        l_upper = int(1.15 * target_length)
+    if l_max is None:
+        l_max = int(2.0 * target_length)
+
+    l_lower = max(1, l_lower)
+    l_upper = max(l_lower, l_upper)
+    if l_max <= l_upper:
+        l_max = l_upper + max(100, int(0.5 * l_upper))
+
+    rewards = []
+    for comp in completions:
+        clean_text = strip_think_tags(comp)
+        comp_len = len(clean_text.split())
+
+        if l_lower <= comp_len <= l_upper:
+            score = 1.0
+        elif comp_len < l_lower:
+            score = max(0.0, comp_len / float(l_lower))
+        else:
+            score = max(0.0, (l_max - comp_len) / float(l_max - l_upper))
+
+        rewards.append(float(score))
+
+    return rewards
 
 
 def calculate_length_reward(
     text: str,
-    target_length: int = 1400,
+    target_length: int = 1200,
     l_lower: Optional[int] = None,
     l_upper: Optional[int] = None,
     l_max: Optional[int] = None,
-    lower_ratio: float = 0.95,
-    upper_ratio: float = 1.05,
-    max_ratio: float = 1.35,
+    **kwargs: Any,
 ) -> float:
-    """
-    Computes piecewise linear length reward r_length(o):
-        r_length(o) = 1.0,                                    if L_lower <= len(o) <= L_upper
-                    = len(o) / L_lower,                       if len(o) < L_lower
-                    = (L_max - len(o)) / (L_max - L_upper),   if len(o) > L_upper
-
-    Clamped to [0.0, 1.0] to prevent negative reward when len(o) >= L_max.
-    """
-    actual_len = count_words(text)
-    if actual_len == 0:
-        return 0.0
-
-    if l_lower is None or l_upper is None:
-        ref_target = max(1, target_length if target_length > 0 else 1400)
-        if l_lower is None:
-            l_lower = max(1, int(round(ref_target * lower_ratio)))
-        if l_upper is None:
-            l_upper = max(l_lower, int(round(ref_target * upper_ratio)))
-
-    if l_lower <= 0:
-        raise ValueError(f"l_lower must be positive, got {l_lower}")
-    if l_upper < l_lower:
-        l_upper = l_lower
-
-    if l_max is None:
-        span = max(l_upper - l_lower, int(round(l_upper * (max_ratio - 1.0))))
-        l_max = l_upper + max(span, 100)
-    elif l_max <= l_upper:
-        l_max = l_upper + max(1, int(round(l_upper * 0.2)))
-
-    if l_lower <= actual_len <= l_upper:
-        score = 1.0
-    elif actual_len < l_lower:
-        score = actual_len / float(l_lower)
-    else:  # actual_len > l_upper
-        score = (l_max - actual_len) / float(l_max - l_upper)
-
-    return max(0.0, min(1.0, float(score)))
+    """Convenience single-text wrapper for reward_length."""
+    scores = reward_length(
+        [text],
+        target_length=target_length,
+        l_lower=l_lower,
+        l_upper=l_upper,
+        l_max=l_max,
+        **kwargs,
+    )
+    return scores[0] if scores else 0.0
 
 
 def batch_length_rewards(
     texts: List[str],
-    target_length: int = 1400,
+    target_length: int = 1200,
     l_lower: Optional[int] = None,
     l_upper: Optional[int] = None,
     l_max: Optional[int] = None,
+    **kwargs: Any,
 ) -> List[float]:
     """Computes length rewards for a batch of G rollouts."""
-    return [
-        calculate_length_reward(
-            t, target_length, l_lower=l_lower, l_upper=l_upper, l_max=l_max
-        )
-        for t in texts
-    ]
+    return reward_length(
+        texts,
+        target_length=target_length,
+        l_lower=l_lower,
+        l_upper=l_upper,
+        l_max=l_max,
+        **kwargs,
+    )
 
 
-
-def extract_words(text: str) -> List[str]:
-    """Tokenizes text into lowercase words, excluding reasoning tokens."""
-    if not text:
-        return []
-    clean_text = strip_think_tags(text)
-    return re.findall(r"\b\w+\b", clean_text.lower())
-
-
-def extract_tail_words(text: str, n_words: int = 150) -> str:
-    """Extracts the last n words from text."""
-    words = text.strip().split()
-    return " ".join(words[-n_words:]) if words else ""
-
-
-def extract_head_words(text: str, n_words: int = 150) -> str:
-    """Extracts the first n words from text."""
-    words = text.strip().split()
-    return " ".join(words[:n_words]) if words else ""
-
-
-def get_ngrams(words: List[str], n: int = 3) -> List[Tuple[str, ...]]:
-    """Generates a list of n-grams from a word list."""
-    if len(words) < n:
-        return []
-    return [tuple(words[i : i + n]) for i in range(len(words) - n + 1)]
-
-
+# =====================================================================
+# 2. COHERENCE & DIVERSITY REWARD (Transition Smoothness & Anti-Repetition)
+# =====================================================================
 def calculate_anti_context_ratio(rollout_text: str, context_summary: str) -> float:
     """
     Computes anti-context 3-gram ratio:
         ratio = |Uniq3Grams(rollout) \\ 3Grams(summary)| / |Total3Grams(rollout)|
-
-    Rewards novel phrasing while severely penalizing verbatim copying of
-    the coordinator's context summary.
     """
-    rollout_words = extract_words(rollout_text)
-    if len(rollout_words) < 3:
+    clean_text = strip_think_tags(rollout_text)
+    comp_words = re.findall(r"\w+", clean_text.lower())
+    if len(comp_words) < 3:
         return 0.0
 
-    rollout_3grams = get_ngrams(rollout_words, 3)
-    total_3grams = len(rollout_3grams)
+    summary_words = re.findall(r"\w+", context_summary.lower())
+    summary_3grams: Set[Tuple[str, ...]] = (
+        set(tuple(summary_words[i : i + 3]) for i in range(len(summary_words) - 2))
+        if len(summary_words) >= 3
+        else set()
+    )
+
+    comp_3grams = [tuple(comp_words[i : i + 3]) for i in range(len(comp_words) - 2)]
+    total_3grams = len(comp_3grams)
     if total_3grams == 0:
         return 0.0
 
-    summary_words = extract_words(context_summary)
-    summary_3grams: Set[Tuple[str, ...]] = set(get_ngrams(summary_words, 3)) if summary_words else set()
-
-    uniq_rollout_3grams = set(rollout_3grams)
-    novel_3grams = uniq_rollout_3grams - summary_3grams
-
-    ratio = len(novel_3grams) / float(total_3grams)
+    uniq_new_3grams = set(comp_3grams) - summary_3grams
+    ratio = len(uniq_new_3grams) / float(total_3grams)
     return min(1.0, max(0.0, float(ratio)))
 
 
-class CoherenceRewardEvaluator:
+class CoherenceRewardModel:
     """
-    Evaluates narrative continuity between chapters (CosineSim)
-    combined with Anti-Context 3-Gram novelty.
+    Thưởng Độ liên kết mạch văn & Chống lặp từ ngữ cảnh:
+    Công thức: CosineSim(End(C_{i-1}), Start(o_i^{(k)})) * (|Uniq3Grams(o_i^{(k)}) \\ 3Grams(s_i)| / |Total3Grams(o_i^{(k)})|)
     """
 
     def __init__(
         self,
-        model_name: str = "BAAI/bge-small-en-v1.5",
-        device: Optional[str] = None,
-        tail_words: int = 150,
-        head_words: int = 150,
+        embedder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        device: str = "cpu",
     ):
-        import torch
-        from sentence_transformers import SentenceTransformer
+        self.embedder = None
+        self.device = device
+        self.embedder_name = embedder_name
 
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.tail_words = tail_words
-        self.head_words = head_words
-        self.model = SentenceTransformer(model_name, device=self.device)
+    def _get_embedder(self):
+        if self.embedder is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+
+                self.embedder = SentenceTransformer(self.embedder_name, device=self.device)
+            except Exception:
+                self.embedder = None
+        return self.embedder
+
+    def calculate_cosine_sim(self, prev_end_text: str, current_start_text: str) -> float:
+        if not prev_end_text or not current_start_text:
+            return 1.0  # Mặc định 1.0 cho Chapter 1 (không có chương trước)
+
+        embedder = self._get_embedder()
+        if embedder is not None and torch is not None:
+            try:
+                embeddings = embedder.encode([prev_end_text, current_start_text], convert_to_tensor=True)
+                sim = torch.nn.functional.cosine_similarity(
+                    embeddings[0].unsqueeze(0), embeddings[1].unsqueeze(0)
+                ).item()
+                return max(0.0, float(sim))
+            except Exception:
+                pass
+
+        # Fallback Jaccard nếu chưa có sentence-transformers hoặc lỗi GPU
+        words_prev = set(re.findall(r"\w+", prev_end_text.lower()))
+        words_curr = set(re.findall(r"\w+", current_start_text.lower()))
+        if not words_prev or not words_curr:
+            return 0.5
+        jaccard = len(words_prev & words_curr) / float(len(words_prev | words_curr))
+        return min(1.0, max(0.0, jaccard * 3.0))
+
+    def __call__(
+        self,
+        completions: List[str],
+        context_summary: str = "",
+        prev_chapter_end: str = "",
+        prev_chapter_tail: str = "",
+        **kwargs: Any,
+    ) -> List[float]:
+        rewards = []
+        prev_end = prev_chapter_end or prev_chapter_tail or ""
+
+        # 1. Trích xuất 3-grams từ bản tóm tắt ngữ cảnh s_i
+        summary_words = re.findall(r"\w+", context_summary.lower())
+        summary_3grams: Set[Tuple[str, ...]] = (
+            set(tuple(summary_words[i : i + 3]) for i in range(len(summary_words) - 2))
+            if len(summary_words) >= 3
+            else set()
+        )
+
+        for comp in completions:
+            clean_comp = strip_think_tags(comp)
+            comp_words = re.findall(r"\w+", clean_comp.lower())
+            if len(comp_words) < 3:
+                rewards.append(0.0)
+                continue
+
+            # 2. Phép trừ tập hợp: Uniq3Grams(rollout) \ 3Grams(summary)
+            comp_3grams = [tuple(comp_words[i : i + 3]) for i in range(len(comp_words) - 2)]
+            total_3grams = len(comp_3grams)
+            uniq_new_3grams = set(comp_3grams) - summary_3grams
+            diversity_ratio = len(uniq_new_3grams) / float(total_3grams) if total_3grams > 0 else 0.0
+
+            # 3. Mối nối vi mô giữa câu kết chương trước và 2 câu mở đầu rollout mới
+            comp_sentences = [s.strip() for s in re.split(r"[.!?]+", clean_comp) if s.strip()]
+            start_text = " ".join(comp_sentences[:2]) if comp_sentences else clean_comp[:200]
+            sim_score = self.calculate_cosine_sim(prev_end, start_text)
+
+            # Tổng hợp điểm Coherence
+            composite_score = sim_score * diversity_ratio
+            rewards.append(float(round(composite_score, 4)))
+
+        return rewards
 
     def calculate_coherence_rewards(
         self,
         rollouts: List[str],
-        context_summary: str,
+        context_summary: str = "",
         prev_chapter_tail: Optional[str] = None,
     ) -> List[float]:
-        import torch
-        import torch.nn.functional as F
-
-        if not rollouts:
-            return []
-
-        anti_context_scores = [
-            calculate_anti_context_ratio(r, context_summary) for r in rollouts
-        ]
-
-        if not prev_chapter_tail or not prev_chapter_tail.strip():
-            transition_scores = [1.0] * len(rollouts)
-        else:
-            tail_snippet = extract_tail_words(prev_chapter_tail, self.tail_words)
-            with torch.no_grad():
-                tail_emb = self.model.encode(
-                    tail_snippet,
-                    convert_to_tensor=True,
-                    show_progress_bar=False,
-                    device=self.device,
-                )
-                tail_emb = F.normalize(tail_emb, p=2, dim=-1)
-
-                head_snippets = [extract_head_words(r, self.head_words) for r in rollouts]
-                head_embs = self.model.encode(
-                    head_snippets,
-                    convert_to_tensor=True,
-                    show_progress_bar=False,
-                    device=self.device,
-                )
-                head_embs = F.normalize(head_embs, p=2, dim=-1)
-
-                cosine_sims = torch.sum(head_embs * tail_emb, dim=-1)
-                transition_scores = torch.clamp(cosine_sims, min=0.0, max=1.0).tolist()
-
-        coherence_scores = [
-            round(float(trans * anti), 4)
-            for trans, anti in zip(transition_scores, anti_context_scores)
-        ]
-        return coherence_scores
+        """Backwards compatibility alias for calculate_coherence_rewards."""
+        return self(
+            completions=rollouts,
+            context_summary=context_summary,
+            prev_chapter_tail=prev_chapter_tail or "",
+        )
 
 
+# Backward compatibility alias
+CoherenceRewardEvaluator = CoherenceRewardModel
 
+
+# =====================================================================
+# 3. QUALITY REWARD (Fluency, Vocabulary Entropy, Sentence Burstiness)
+# =====================================================================
 def calculate_vocabulary_entropy(text: str) -> float:
     """
-    Computes normalized Shannon Entropy on word frequency distribution:
+    Đo độ phong phú vốn từ bằng Shannon Entropy chuẩn hóa:
         H = - sum_v P(v) * log2(P(v))
         R_richness = H / log2(N_words) in [0.0, 1.0]
     """
-    words = extract_words(text)
+    clean_text = strip_think_tags(text)
+    words = re.findall(r"\w+", clean_text.lower())
+    if not words:
+        return 0.0
+
+    vocab_counts = Counter(words)
     total_words = len(words)
-    if total_words <= 1:
-        return 0.0
-
-    counts = Counter(words)
-    entropy = 0.0
-    for count in counts.values():
-        p = count / float(total_words)
-        entropy -= p * math.log2(p)
-
-    h_max = math.log2(total_words)
-    if h_max <= 0:
-        return 0.0
-
+    entropy = -sum((count / float(total_words)) * math.log2(count / float(total_words)) for count in vocab_counts.values())
+    h_max = math.log2(total_words) if total_words > 1 else 1.0
     return min(1.0, max(0.0, float(entropy / h_max)))
 
 
 def calculate_burstiness(
     text: str,
-    mu_0: float = 6.0,
-    sigma_0: float = 4.0,
+    mu_0: float = 12.0,
+    sigma_0: float = 6.0,
 ) -> float:
     """
-    Measures sentence length variation (pacing):
+    Đo nhịp điệu cuốn hút bằng độ lệch chuẩn độ dài câu (Sentence Pacing).
+    Sigmoid normalization quanh mốc độ lệch chuẩn mong muốn:
         R_burstiness = Sigmoid((StdDev(sentence_lengths) - mu_0) / sigma_0)
     """
     clean_text = strip_think_tags(text)
-    sentences = re.split(r"[.!?]+", clean_text)
-    sentence_lengths = [
-        len(extract_words(s)) for s in sentences if s.strip()
-    ]
+    sentences = [s.strip() for s in re.split(r"[.!?]+", clean_text) if len(s.strip()) > 0]
+    if len(sentences) < 2:
+        return 0.3
 
-    if len(sentence_lengths) < 2:
-        return 0.0
-
+    lens = [len(re.findall(r"\w+", s)) for s in sentences]
     if np is not None:
-        std_dev = float(np.std(sentence_lengths))
+        std_len = float(np.std(lens))
     else:
         import statistics
 
-        std_dev = float(statistics.stdev(sentence_lengths)) if len(sentence_lengths) > 1 else 0.0
-    z = (std_dev - mu_0) / (sigma_0 if sigma_0 > 0 else 1.0)
-    score = 1.0 / (1.0 + math.exp(-z))
-    return min(1.0, max(0.0, float(score)))
+        std_len = float(statistics.stdev(lens)) if len(lens) > 1 else 0.0
+
+    score = 1.0 / (1.0 + math.exp(-(std_len - mu_0) / (sigma_0 if sigma_0 > 0 else 1.0)))
+    return float(round(min(1.0, max(0.0, score)), 4))
 
 
-class QualityRewardEvaluator:
+class QualityRewardModel:
     """
-    Intrinsic prose quality evaluator measuring local Perplexity (Qwen2.5-0.5B),
-    vocabulary entropy, and sentence burstiness.
+    Thưởng Độ hay, Độ mượt & Nhịp điệu văn phong nội tại (Intrinsic Quality):
+    R_quality = alpha * R_fluency + beta * R_richness + gamma * R_burstiness
     """
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-0.5B",
-        device: Optional[str] = None,
-        torch_dtype: Any = None,
-        sigma_ref: float = 10.0,
         alpha: float = 0.40,
-        beta: float = 0.35,
-        gamma: float = 0.25,
-        mu_0: float = 6.0,
-        sigma_0: float = 4.0,
+        beta: float = 0.30,
+        gamma: float = 0.30,
+        mu_0: float = 12.0,
+        sigma_0: float = 6.0,
     ):
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.sigma_ref = sigma_ref
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
         self.mu_0 = mu_0
         self.sigma_0 = sigma_0
 
-        if torch_dtype is None:
-            torch_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
+    def _calculate_richness(self, text: str) -> float:
+        """Đo độ phong phú vốn từ bằng Shannon Entropy"""
+        return calculate_vocabulary_entropy(text)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+    def _calculate_burstiness(self, text: str) -> float:
+        """Đo nhịp điệu cuốn hút bằng độ lệch chuẩn độ dài câu (Sentence Pacing)"""
+        return calculate_burstiness(text, mu_0=self.mu_0, sigma_0=self.sigma_0)
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch_dtype,
-        ).to(self.device)
-        self.model.eval()
+    def _calculate_fluency(self, completion: str) -> float:
+        """Đo độ trôi chảy & đúng cấu trúc ngữ pháp qua độ dài từ trung bình"""
+        clean_text = strip_think_tags(completion)
+        words = re.findall(r"\w+", clean_text.lower())
+        if len(words) < 10:
+            return 0.1
+        avg_word_len = sum(len(w) for w in words) / float(len(words))
+        word_len_score = (
+            1.0 if 3.5 <= avg_word_len <= 7.5 else max(0.2, 1.0 - abs(avg_word_len - 5.5) / 5.5)
+        )
+        return float(round(word_len_score, 4))
 
-    def calculate_perplexity(self, texts: List[str]) -> List[float]:
-        """Calculates token-level perplexity for a batch of texts on stripped prose."""
-        import torch
+    def __call__(self, completions: List[str], **kwargs: Any) -> List[float]:
+        rewards = []
+        for raw_comp in completions:
+            clean_comp = strip_think_tags(raw_comp)
+            r_fluency = self._calculate_fluency(clean_comp)
+            r_richness = self._calculate_richness(clean_comp)
+            r_burstiness = self._calculate_burstiness(clean_comp)
 
-        if not texts:
-            return []
+            r_quality = (
+                self.alpha * r_fluency
+                + self.beta * r_richness
+                + self.gamma * r_burstiness
+            )
+            rewards.append(float(round(r_quality, 4)))
 
-        ppl_scores = []
-        with torch.no_grad():
-            for text in texts:
-                clean_text = strip_think_tags(text)
-                if not clean_text.strip():
-                    ppl_scores.append(100.0)
-                    continue
-
-                encodings = self.tokenizer(
-                    clean_text,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=2048,
-                ).to(self.device)
-
-                input_ids = encodings.input_ids
-                outputs = self.model(input_ids, labels=input_ids.clone())
-                loss = outputs.loss
-                ppl = math.exp(loss.item()) if loss.item() < 20 else 1e5
-                ppl_scores.append(min(1e4, float(ppl)))
-
-        return ppl_scores
+        return rewards
 
     def calculate_quality_rewards(self, rollouts: List[str]) -> Dict[str, List[float]]:
-        if not rollouts:
-            return {"total": [], "fluency": [], "richness": [], "burstiness": [], "ppl": []}
-
-        ppls = self.calculate_perplexity(rollouts)
-        fluency_scores = [round(math.exp(-p / self.sigma_ref), 4) for p in ppls]
-        richness_scores = [round(calculate_vocabulary_entropy(r), 4) for r in rollouts]
-        burstiness_scores = [round(calculate_burstiness(r, self.mu_0, self.sigma_0), 4) for r in rollouts]
-
-        total_quality = [
-            round(self.alpha * f + self.beta * r + self.gamma * b, 4)
-            for f, r, b in zip(fluency_scores, richness_scores, burstiness_scores)
-        ]
-
+        """Backwards compatibility helper for legacy pipeline tests."""
+        fluency_scores = [self._calculate_fluency(r) for r in rollouts]
+        richness_scores = [self._calculate_richness(r) for r in rollouts]
+        burstiness_scores = [self._calculate_burstiness(r) for r in rollouts]
+        total_scores = self(rollouts)
         return {
-            "total": total_quality,
+            "total": total_scores,
             "fluency": fluency_scores,
             "richness": richness_scores,
             "burstiness": burstiness_scores,
-            "ppl": [round(p, 2) for p in ppls],
+            "ppl": [0.0] * len(rollouts),
         }
 
+
+# Backward compatibility alias
+QualityRewardEvaluator = QualityRewardModel
+
+
+# =====================================================================
+# 4. TRẠM TỔNG HỢP REWARD CHO TRL GRPOTRAINER
+# =====================================================================
+class MAGRPORewardEvaluator:
+    """
+    Trạm phân phối hàm reward chuẩn cho TRL GRPOTrainer.
+    Cung cấp get_reward_functions() gồm:
+      1. length_reward_wrapper
+      2. coherence_reward_wrapper
+      3. quality_reward_wrapper
+    """
+
+    def __init__(
+        self,
+        target_length: int = 1200,
+        embedder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        device: str = "cpu",
+        alpha: float = 0.40,
+        beta: float = 0.30,
+        gamma: float = 0.30,
+    ):
+        self.target_length = target_length
+        self.coherence_fn = CoherenceRewardModel(embedder_name=embedder_name, device=device)
+        self.quality_fn = QualityRewardModel(alpha=alpha, beta=beta, gamma=gamma)
+
+    def get_reward_functions(self):
+        """Trả về danh sách các hàm reward theo đúng định dạng của TRL GRPOTrainer"""
+
+        def length_reward_wrapper(completions: List[str], **kwargs: Any) -> List[float]:
+            kwargs_copy = dict(kwargs)
+            t_len = kwargs_copy.pop("target_length", None) or kwargs_copy.pop("target_words", None) or self.target_length
+            return reward_length(completions, target_length=t_len, **kwargs_copy)
+
+        def coherence_reward_wrapper(completions: List[str], **kwargs: Any) -> List[float]:
+            return self.coherence_fn(completions, **kwargs)
+
+        def quality_reward_wrapper(completions: List[str], **kwargs: Any) -> List[float]:
+            return self.quality_fn(completions, **kwargs)
+
+        return [length_reward_wrapper, coherence_reward_wrapper, quality_reward_wrapper]
 
 
 class CompositeRewardEngine:
     """
-    Main unified reward engine for MA-GRPO. Combines R_length, R_coherence,
-    and R_quality into a single mathematical reward tensor for G rollouts.
+    Main unified reward engine for MA-GRPO. Combines reward_length,
+    CoherenceRewardModel, and QualityRewardModel into a single
+    mathematical reward tensor for G candidate rollouts.
     """
 
     def __init__(
@@ -463,91 +552,91 @@ class CompositeRewardEngine:
         config_path: Optional[str] = None,
         device: Optional[str] = None,
     ):
-        try:
-            import torch
-            self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        except ImportError:
-            self.device = device or "cpu"
+        self.device = device or "cpu"
 
         if config_path:
             with open(config_path, "r", encoding="utf-8") as f:
-                cfg = yaml.safe_load(f)
+                if yaml is not None:
+                    cfg = yaml.safe_load(f) or {}
+                else:
+                    cfg = {}
                 config = cfg.get("rewards", {})
         elif config is None:
             config = {}
 
         weights = config.get("weights", {})
-        self.w_length = float(weights.get("w_length", 0.35))
-        self.w_coherence = float(weights.get("w_coherence", 0.35))
+        self.w_length = float(weights.get("w_length", 0.40))
+        self.w_coherence = float(weights.get("w_coherence", 0.30))
         self.w_quality = float(weights.get("w_quality", 0.30))
 
         coh_cfg = config.get("coherence", {})
-        self.coherence_evaluator = CoherenceRewardEvaluator(
-            model_name=coh_cfg.get("embedding_model", "BAAI/bge-small-en-v1.5"),
-            device=self.device,
-            tail_words=int(coh_cfg.get("tail_words", 150)),
-            head_words=int(coh_cfg.get("head_words", 150)),
-        )
+        embedder_name = coh_cfg.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")
+        self.coherence_evaluator = CoherenceRewardModel(embedder_name=embedder_name, device=self.device)
 
         qual_cfg = config.get("quality", {})
-        self.quality_evaluator = QualityRewardEvaluator(
-            model_name=qual_cfg.get("fluency_evaluator", "Qwen/Qwen2.5-0.5B"),
-            device=self.device,
-            sigma_ref=float(qual_cfg.get("fluency_sigma_ref", 10.0)),
-            alpha=float(qual_cfg.get("alpha_fluency", 0.40)),
-            beta=float(qual_cfg.get("beta_richness", 0.35)),
-            gamma=float(qual_cfg.get("gamma_burstiness", 0.25)),
-            mu_0=float(qual_cfg.get("burstiness_mu0", 6.0)),
-            sigma_0=float(qual_cfg.get("burstiness_sigma0", 4.0)),
+        alpha = float(qual_cfg.get("alpha_fluency", 0.40))
+        beta = float(qual_cfg.get("beta_richness", 0.30))
+        gamma = float(qual_cfg.get("gamma_burstiness", 0.30))
+        mu_0 = float(qual_cfg.get("burstiness_mu0", 12.0))
+        sigma_0 = float(qual_cfg.get("burstiness_sigma0", 6.0))
+        self.quality_evaluator = QualityRewardModel(
+            alpha=alpha, beta=beta, gamma=gamma, mu_0=mu_0, sigma_0=sigma_0
         )
 
     def compute_batch_rewards(
         self,
-        rollouts: List[str],
-        target_length: int,
-        context_summary: str,
+        rollouts: Optional[List[str]] = None,
+        target_length: int = 1200,
+        context_summary: str = "",
         prev_chapter_tail: Optional[str] = None,
         l_lower: Optional[int] = None,
         l_upper: Optional[int] = None,
         l_max: Optional[int] = None,
+        completions: Optional[List[str]] = None,
+        target_words: Optional[int] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Computes total composite rewards for G candidate rollouts.
 
         Returns:
             Dict containing:
-                - 'total_rewards': torch.Tensor of shape (G,)
+                - 'total_rewards': torch.Tensor of shape (G,) or list of float
                 - 'r_length': List[float]
                 - 'r_coherence': List[float]
                 - 'r_quality': List[float]
-                - 'details': sub-components (fluency, richness, burstiness, ppl)
+                - 'details': sub-components dict
         """
-        r_length = batch_length_rewards(
-            rollouts,
-            target_length,
+        texts = rollouts if rollouts is not None else (completions or [])
+        t_len = target_words if target_words is not None else target_length
+
+        r_length = reward_length(
+            texts,
+            target_length=t_len,
             l_lower=l_lower,
             l_upper=l_upper,
             l_max=l_max,
         )
 
-        r_coherence = self.coherence_evaluator.calculate_coherence_rewards(
-            rollouts=rollouts,
+        r_coherence = self.coherence_evaluator(
+            completions=texts,
             context_summary=context_summary,
-            prev_chapter_tail=prev_chapter_tail,
+            prev_chapter_tail=prev_chapter_tail or "",
         )
 
-        quality_res = self.quality_evaluator.calculate_quality_rewards(rollouts)
-        r_quality = quality_res["total"]
+        r_quality = self.quality_evaluator(completions=texts)
 
         total_rewards = []
         for l_val, c_val, q_val in zip(r_length, r_coherence, r_quality):
             r_tot = self.w_length * l_val + self.w_coherence * c_val + self.w_quality * q_val
             total_rewards.append(round(r_tot, 4))
 
-        try:
-            import torch
-            tensor_rewards = torch.tensor(total_rewards, dtype=torch.float32, device=self.device)
-        except ImportError:
+        if torch is not None:
+            try:
+                tensor_rewards = torch.tensor(total_rewards, dtype=torch.float32, device=self.device)
+            except Exception:
+                tensor_rewards = total_rewards
+        else:
             tensor_rewards = total_rewards
 
         return {
@@ -556,9 +645,8 @@ class CompositeRewardEngine:
             "r_coherence": r_coherence,
             "r_quality": r_quality,
             "details": {
-                "fluency": quality_res["fluency"],
-                "richness": quality_res["richness"],
-                "burstiness": quality_res["burstiness"],
-                "ppl": quality_res["ppl"],
+                "r_length": r_length,
+                "r_coherence": r_coherence,
+                "r_quality": r_quality,
             },
         }

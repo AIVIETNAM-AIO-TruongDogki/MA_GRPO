@@ -4,8 +4,17 @@ Verifies mathematical soundness, boundary conditions, and anti-hacking propertie
 """
 
 import math
+import sys
 import unittest
-import numpy as np
+from pathlib import Path
+
+# Add project root to sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 from src.rewards import (
     calculate_length_reward,
@@ -16,6 +25,11 @@ from src.rewards import (
     extract_tail_words,
     calculate_burstiness,
     calculate_vocabulary_entropy,
+    reward_length,
+    CoherenceRewardModel,
+    QualityRewardModel,
+    MAGRPORewardEvaluator,
+    CompositeRewardEngine,
 )
 
 
@@ -136,6 +150,57 @@ class TestMAGRPORewards(unittest.TestCase):
         head = extract_head_words(text, n_words=10)
         self.assertEqual(head, " ".join([f"w{i}" for i in range(10)]))
         self.assertEqual(tail, " ".join([f"w{i}" for i in range(90, 100)]))
+
+
+    def test_standard_reward_length(self):
+        # Target 1200: safe zone [1020, 1380] -> 1.0
+        r_exact = reward_length(["word " * 1200], target_length=1200)[0]
+        self.assertAlmostEqual(r_exact, 1.0, places=4)
+
+        r_safe_min = reward_length(["word " * 1020], target_length=1200)[0]
+        self.assertAlmostEqual(r_safe_min, 1.0, places=4)
+
+        r_safe_max = reward_length(["word " * 1380], target_length=1200)[0]
+        self.assertAlmostEqual(r_safe_max, 1.0, places=4)
+
+        # Under-length: 510 words / 1020 = 0.5
+        r_under = reward_length(["word " * 510], target_length=1200)[0]
+        self.assertAlmostEqual(r_under, 0.5, places=4)
+
+        # Over-length: (2400 - 1890) / (2400 - 1380) = 510 / 1020 = 0.5
+        r_over = reward_length(["word " * 1890], target_length=1200)[0]
+        self.assertAlmostEqual(r_over, 0.5, places=4)
+
+        # Extreme over-length: >= 2400 words -> 0.0
+        r_extreme = reward_length(["word " * 2500], target_length=1200)[0]
+        self.assertAlmostEqual(r_extreme, 0.0, places=4)
+
+    def test_standard_quality_model(self):
+        qm = QualityRewardModel()
+        prose = "The detective entered the silent room. Dust particles danced in the pale moonlight that filtered through the cracked blinds."
+        scores = qm([prose])
+        self.assertEqual(len(scores), 1)
+        self.assertGreater(scores[0], 0.0)
+        self.assertLessEqual(scores[0], 1.0)
+
+    def test_standard_evaluator_and_engine(self):
+        evaluator = MAGRPORewardEvaluator(device="cpu")
+        fl, fc, fq = evaluator.get_reward_functions()
+        self.assertEqual(len(fl(["word " * 1200], target_length=1200)), 1)
+        self.assertEqual(len(fc(["A new beginning."], prev_chapters=["An old ending."], summaries=["Summary."])), 1)
+        self.assertEqual(len(fq(["A high quality sentence here."])), 1)
+
+        engine = CompositeRewardEngine()
+        res = engine.compute_batch_rewards(
+            completions=["A nicely written chapter test rollout with good variety and vocabulary."],
+            target_words=10,
+            prev_chapter_tail="Ending of previous chapter.",
+            context_summary="Context summary.",
+        )
+        self.assertIn("total_rewards", res)
+        self.assertIn("r_length", res)
+        self.assertIn("r_coherence", res)
+        self.assertIn("r_quality", res)
 
 
 if __name__ == "__main__":
