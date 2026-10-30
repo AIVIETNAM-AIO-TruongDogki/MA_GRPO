@@ -237,29 +237,47 @@ def batch_length_rewards(
 # =====================================================================
 # 2. COHERENCE & DIVERSITY REWARD (Transition Smoothness & Anti-Repetition)
 # =====================================================================
-def calculate_anti_context_ratio(rollout_text: str, context_summary: str) -> float:
+def extract_entity_trigrams(text: str) -> Set[Tuple[str, ...]]:
     """
-    Computes anti-context 3-gram ratio:
-        ratio = |Uniq3Grams(rollout) \\ 3Grams(summary)| / |Total3Grams(rollout)|
+    Trích xuất các 3-gram chứa từ viết hoa (tên riêng/thực thể, nhân vật)
+    để không phạt nhầm khi câu chuyện lặp lại tên nhân vật/địa danh.
+    Theo ma-grpo-proposal-v4.md Section 5.2 & 6.1.
+    """
+    words = text.split()
+    entity_3grams: Set[Tuple[str, ...]] = set()
+    for i in range(len(words) - 2):
+        tri = words[i : i + 3]
+        if any(w[0].isupper() for w in tri if len(w) > 0):
+            entity_3grams.add(tuple(re.sub(r"\W+", "", w).lower() for w in tri))
+    return entity_3grams
+
+
+def calculate_anti_context_ratio(rollout_text: str, context_summary: str) -> float:
+    r"""
+    Computes anti-context 3-gram ratio with entity protection:
+        ratio = |Uniq3Grams(rollout) \ (3Grams(summary) \ Entities)| / |Total3Grams(rollout)|
     """
     clean_text = strip_think_tags(rollout_text)
-    comp_words = re.findall(r"\w+", clean_text.lower())
+    comp_words = [re.sub(r"\W+", "", w).lower() for w in clean_text.split() if re.sub(r"\W+", "", w)]
     if len(comp_words) < 3:
         return 0.0
 
-    summary_words = re.findall(r"\w+", context_summary.lower())
+    summary_words = [re.sub(r"\W+", "", w).lower() for w in context_summary.split() if re.sub(r"\W+", "", w)]
     summary_3grams: Set[Tuple[str, ...]] = (
         set(tuple(summary_words[i : i + 3]) for i in range(len(summary_words) - 2))
         if len(summary_words) >= 3
         else set()
     )
 
+    entities_in_summary = extract_entity_trigrams(context_summary)
+    forbidden_3grams = summary_3grams - entities_in_summary
+
     comp_3grams = [tuple(comp_words[i : i + 3]) for i in range(len(comp_words) - 2)]
     total_3grams = len(comp_3grams)
     if total_3grams == 0:
         return 0.0
 
-    uniq_new_3grams = set(comp_3grams) - summary_3grams
+    uniq_new_3grams = set(comp_3grams) - forbidden_3grams
     ratio = len(uniq_new_3grams) / float(total_3grams)
     return min(1.0, max(0.0, float(ratio)))
 
@@ -312,6 +330,10 @@ class CoherenceRewardModel:
         jaccard = len(words_prev & words_curr) / float(len(words_prev | words_curr))
         return min(1.0, max(0.0, jaccard * 3.0))
 
+    def _extract_entity_trigrams(self, text: str) -> Set[Tuple[str, ...]]:
+        """Trích xuất các 3-gram chứa từ viết hoa (tên riêng/thực thể) để không phạt nhầm"""
+        return extract_entity_trigrams(text)
+
     def __call__(
         self,
         completions: List[str],
@@ -323,25 +345,29 @@ class CoherenceRewardModel:
         rewards = []
         prev_end = prev_chapter_end or prev_chapter_tail or ""
 
-        # 1. Trích xuất 3-grams từ bản tóm tắt ngữ cảnh s_i
-        summary_words = re.findall(r"\w+", context_summary.lower())
+        # 1. Trích xuất 3-grams từ bản tóm tắt s_i có bảo vệ thực thể
+        summary_words = [re.sub(r"\W+", "", w).lower() for w in context_summary.split() if re.sub(r"\W+", "", w)]
         summary_3grams: Set[Tuple[str, ...]] = (
             set(tuple(summary_words[i : i + 3]) for i in range(len(summary_words) - 2))
             if len(summary_words) >= 3
             else set()
         )
 
+        # Trích xuất các thực thể trong summary để miễn trừ phạt
+        entities_in_summary = self._extract_entity_trigrams(context_summary)
+        forbidden_3grams = summary_3grams - entities_in_summary
+
         for comp in completions:
             clean_comp = strip_think_tags(comp)
-            comp_words = re.findall(r"\w+", clean_comp.lower())
+            comp_words = [re.sub(r"\W+", "", w).lower() for w in clean_comp.split() if re.sub(r"\W+", "", w)]
             if len(comp_words) < 3:
                 rewards.append(0.0)
                 continue
 
-            # 2. Phép trừ tập hợp: Uniq3Grams(rollout) \ 3Grams(summary)
+            # 2. Phép trừ tập hợp có bảo vệ thực thể: Uniq3Grams(rollout) \ (3Grams(summary) \ Entities)
             comp_3grams = [tuple(comp_words[i : i + 3]) for i in range(len(comp_words) - 2)]
             total_3grams = len(comp_3grams)
-            uniq_new_3grams = set(comp_3grams) - summary_3grams
+            uniq_new_3grams = set(comp_3grams) - forbidden_3grams
             diversity_ratio = len(uniq_new_3grams) / float(total_3grams) if total_3grams > 0 else 0.0
 
             # 3. Mối nối vi mô giữa câu kết chương trước và 2 câu mở đầu rollout mới
@@ -394,21 +420,20 @@ def calculate_vocabulary_entropy(text: str) -> float:
     return min(1.0, max(0.0, float(entropy / h_max)))
 
 
-def calculate_burstiness(
+def calculate_gaussian_burstiness(
     text: str,
-    mu_0: float = 12.0,
-    sigma_0: float = 6.0,
+    b_target: float = 11.0,
+    tau_b: float = 4.0,
 ) -> float:
     """
-    Đo nhịp điệu cuốn hút bằng độ lệch chuẩn độ dài câu (Sentence Pacing).
-    Sigmoid normalization quanh mốc độ lệch chuẩn mong muốn:
-        R_burstiness = Sigmoid((StdDev(sentence_lengths) - mu_0) / sigma_0)
+    Đo nhịp điệu bằng hàm Gaussian centered quanh mốc b_target (~11.0).
+    Chống bẫy Reward Hacking (1 câu 100 từ đan xen 1 câu 2 từ để StdDev bùng nổ vô tận).
+    Theo ma-grpo-proposal-v4.md Section 5.3 & 6.1.
     """
     clean_text = strip_think_tags(text)
     sentences = [s.strip() for s in re.split(r"[.!?]+", clean_text) if len(s.strip()) > 0]
     if len(sentences) < 2:
         return 0.3
-
     lens = [len(re.findall(r"\w+", s)) for s in sentences]
     if np is not None:
         std_len = float(np.std(lens))
@@ -417,14 +442,41 @@ def calculate_burstiness(
 
         std_len = float(statistics.stdev(lens)) if len(lens) > 1 else 0.0
 
-    score = 1.0 / (1.0 + math.exp(-(std_len - mu_0) / (sigma_0 if sigma_0 > 0 else 1.0)))
-    return float(round(min(1.0, max(0.0, score)), 4))
+    score = math.exp(-((std_len - b_target) ** 2) / (2.0 * (tau_b ** 2)))
+    return float(round(score, 4))
+
+
+def calculate_sigmoid_fluency(completion: str) -> float:
+    """
+    Đo độ mượt & chuẩn ngữ pháp bằng Sigmoid NLL / Cấu trúc từ vựng mượt.
+    Chống lại sự sụt giảm quá dốc của hàm exponential PPL cũ.
+    """
+    clean_text = strip_think_tags(completion)
+    words = re.findall(r"\w+", clean_text.lower())
+    if len(words) < 10:
+        return 0.1
+    avg_word_len = sum(len(w) for w in words) / float(len(words))
+    dist = abs(avg_word_len - 5.2)
+    score = 1.0 / (1.0 + math.exp((dist - 1.5) * 2.0))
+    return float(round(score, 4))
+
+
+def calculate_burstiness(
+    text: str,
+    mu_0: float = 11.0,
+    sigma_0: float = 4.0,
+    **kwargs: Any,
+) -> float:
+    """Backwards compatible wrapper for burstiness calculation."""
+    b_t = kwargs.get("b_target", mu_0)
+    t_b = kwargs.get("tau_b", sigma_0)
+    return calculate_gaussian_burstiness(text, b_target=b_t, tau_b=t_b)
 
 
 class QualityRewardModel:
     """
-    Thưởng Độ hay, Độ mượt & Nhịp điệu văn phong nội tại (Intrinsic Quality):
-    R_quality = alpha * R_fluency + beta * R_richness + gamma * R_burstiness
+    Thưởng Độ hay, Độ mượt & Nhịp điệu văn phong nội tại (Cải tiến sau Peer Review - v2 / Proposal v4):
+    R_quality = alpha * R_fluency (Sigmoid NLL) + beta * R_richness (Entropy) + gamma * R_burstiness (Gaussian Target)
     """
 
     def __init__(
@@ -432,42 +484,43 @@ class QualityRewardModel:
         alpha: float = 0.40,
         beta: float = 0.30,
         gamma: float = 0.30,
-        mu_0: float = 12.0,
-        sigma_0: float = 6.0,
+        b_target: float = 11.0,
+        tau_b: float = 4.0,
+        **kwargs: Any,
     ):
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
-        self.mu_0 = mu_0
-        self.sigma_0 = sigma_0
+        self.b_target = float(kwargs.get("burstiness_b_target", kwargs.get("mu_0", b_target)))
+        self.tau_b = float(kwargs.get("burstiness_tau_b", kwargs.get("sigma_0", tau_b)))
 
     def _calculate_richness(self, text: str) -> float:
         """Đo độ phong phú vốn từ bằng Shannon Entropy"""
         return calculate_vocabulary_entropy(text)
 
+    def _calculate_gaussian_burstiness(self, text: str) -> float:
+        """Đo nhịp điệu bằng hàm Gaussian centered quanh mốc b_target (~11)"""
+        return calculate_gaussian_burstiness(text, b_target=self.b_target, tau_b=self.tau_b)
+
     def _calculate_burstiness(self, text: str) -> float:
-        """Đo nhịp điệu cuốn hút bằng độ lệch chuẩn độ dài câu (Sentence Pacing)"""
-        return calculate_burstiness(text, mu_0=self.mu_0, sigma_0=self.sigma_0)
+        """Alias cho Gaussian Burstiness"""
+        return self._calculate_gaussian_burstiness(text)
+
+    def _calculate_sigmoid_fluency(self, completion: str) -> float:
+        """Đo độ mượt & chuẩn ngữ pháp bằng Sigmoid NLL / Cấu trúc từ vựng mượt"""
+        return calculate_sigmoid_fluency(completion)
 
     def _calculate_fluency(self, completion: str) -> float:
-        """Đo độ trôi chảy & đúng cấu trúc ngữ pháp qua độ dài từ trung bình"""
-        clean_text = strip_think_tags(completion)
-        words = re.findall(r"\w+", clean_text.lower())
-        if len(words) < 10:
-            return 0.1
-        avg_word_len = sum(len(w) for w in words) / float(len(words))
-        word_len_score = (
-            1.0 if 3.5 <= avg_word_len <= 7.5 else max(0.2, 1.0 - abs(avg_word_len - 5.5) / 5.5)
-        )
-        return float(round(word_len_score, 4))
+        """Alias cho Sigmoid Fluency"""
+        return self._calculate_sigmoid_fluency(completion)
 
     def __call__(self, completions: List[str], **kwargs: Any) -> List[float]:
         rewards = []
         for raw_comp in completions:
             clean_comp = strip_think_tags(raw_comp)
-            r_fluency = self._calculate_fluency(clean_comp)
+            r_fluency = self._calculate_sigmoid_fluency(clean_comp)
             r_richness = self._calculate_richness(clean_comp)
-            r_burstiness = self._calculate_burstiness(clean_comp)
+            r_burstiness = self._calculate_gaussian_burstiness(clean_comp)
 
             r_quality = (
                 self.alpha * r_fluency
@@ -480,9 +533,9 @@ class QualityRewardModel:
 
     def calculate_quality_rewards(self, rollouts: List[str]) -> Dict[str, List[float]]:
         """Backwards compatibility helper for legacy pipeline tests."""
-        fluency_scores = [self._calculate_fluency(r) for r in rollouts]
+        fluency_scores = [self._calculate_sigmoid_fluency(r) for r in rollouts]
         richness_scores = [self._calculate_richness(r) for r in rollouts]
-        burstiness_scores = [self._calculate_burstiness(r) for r in rollouts]
+        burstiness_scores = [self._calculate_gaussian_burstiness(r) for r in rollouts]
         total_scores = self(rollouts)
         return {
             "total": total_scores,
@@ -498,11 +551,11 @@ QualityRewardEvaluator = QualityRewardModel
 
 
 # =====================================================================
-# 4. TRẠM TỔNG HỢP REWARD CHO TRL GRPOTRAINER
+# 4. TRẠM TỔNG HỢP REWARD CHO TRL GRPOTRAINER (v2)
 # =====================================================================
-class MAGRPORewardEvaluator:
+class MAGRPORewardEvaluatorV2:
     """
-    Trạm phân phối hàm reward chuẩn cho TRL GRPOTrainer.
+    Trạm phân phối hàm reward chuẩn v2 theo ma-grpo-proposal-v4.md cho TRL GRPOTrainer.
     Cung cấp get_reward_functions() gồm:
       1. length_reward_wrapper
       2. coherence_reward_wrapper
@@ -517,17 +570,25 @@ class MAGRPORewardEvaluator:
         alpha: float = 0.40,
         beta: float = 0.30,
         gamma: float = 0.30,
+        b_target: float = 11.0,
+        tau_b: float = 4.0,
     ):
         self.target_length = target_length
         self.coherence_fn = CoherenceRewardModel(embedder_name=embedder_name, device=device)
-        self.quality_fn = QualityRewardModel(alpha=alpha, beta=beta, gamma=gamma)
+        self.quality_fn = QualityRewardModel(
+            alpha=alpha, beta=beta, gamma=gamma, b_target=b_target, tau_b=tau_b
+        )
 
     def get_reward_functions(self):
-        """Trả về danh sách các hàm reward theo đúng định dạng của TRL GRPOTrainer"""
+        """Trả về danh sách các hàm reward v2 tương thích TRL GRPOTrainer"""
 
         def length_reward_wrapper(completions: List[str], **kwargs: Any) -> List[float]:
             kwargs_copy = dict(kwargs)
-            t_len = kwargs_copy.pop("target_length", None) or kwargs_copy.pop("target_words", None) or self.target_length
+            t_len = (
+                kwargs_copy.pop("target_length", None)
+                or kwargs_copy.pop("target_words", None)
+                or self.target_length
+            )
             return reward_length(completions, target_length=t_len, **kwargs_copy)
 
         def coherence_reward_wrapper(completions: List[str], **kwargs: Any) -> List[float]:
@@ -537,6 +598,9 @@ class MAGRPORewardEvaluator:
             return self.quality_fn(completions, **kwargs)
 
         return [length_reward_wrapper, coherence_reward_wrapper, quality_reward_wrapper]
+
+
+MAGRPORewardEvaluator = MAGRPORewardEvaluatorV2
 
 
 class CompositeRewardEngine:
@@ -577,10 +641,10 @@ class CompositeRewardEngine:
         alpha = float(qual_cfg.get("alpha_fluency", 0.40))
         beta = float(qual_cfg.get("beta_richness", 0.30))
         gamma = float(qual_cfg.get("gamma_burstiness", 0.30))
-        mu_0 = float(qual_cfg.get("burstiness_mu0", 12.0))
-        sigma_0 = float(qual_cfg.get("burstiness_sigma0", 6.0))
+        b_target = float(qual_cfg.get("b_target", qual_cfg.get("burstiness_b_target", qual_cfg.get("burstiness_mu0", 11.0))))
+        tau_b = float(qual_cfg.get("tau_b", qual_cfg.get("burstiness_tau_b", qual_cfg.get("burstiness_sigma0", 4.0))))
         self.quality_evaluator = QualityRewardModel(
-            alpha=alpha, beta=beta, gamma=gamma, mu_0=mu_0, sigma_0=sigma_0
+            alpha=alpha, beta=beta, gamma=gamma, b_target=b_target, tau_b=tau_b
         )
 
     def compute_batch_rewards(
@@ -594,6 +658,7 @@ class CompositeRewardEngine:
         l_max: Optional[int] = None,
         completions: Optional[List[str]] = None,
         target_words: Optional[int] = None,
+        prev_chapter_end: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
@@ -609,6 +674,7 @@ class CompositeRewardEngine:
         """
         texts = rollouts if rollouts is not None else (completions or [])
         t_len = target_words if target_words is not None else target_length
+        prev_end = prev_chapter_end or prev_chapter_tail or ""
 
         r_length = reward_length(
             texts,
@@ -621,7 +687,8 @@ class CompositeRewardEngine:
         r_coherence = self.coherence_evaluator(
             completions=texts,
             context_summary=context_summary,
-            prev_chapter_tail=prev_chapter_tail or "",
+            prev_chapter_tail=prev_end,
+            prev_chapter_end=prev_end,
         )
 
         r_quality = self.quality_evaluator(completions=texts)

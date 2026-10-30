@@ -44,5 +44,5 @@ rewards:
     alpha_fluency: 0.40
     beta_richness: 0.30
     gamma_burstiness: 0.30
-    burstiness_mu0: 12.0
-    burstiness_sigma0: 6.0
+    b_target: 11.0
+    tau_b: 4.0

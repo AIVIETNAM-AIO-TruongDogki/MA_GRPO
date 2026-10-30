@@ -21,14 +21,18 @@ from src.rewards import (
     extract_length_bounds,
     count_words,
     calculate_anti_context_ratio,
+    extract_entity_trigrams,
     extract_head_words,
     extract_tail_words,
     calculate_burstiness,
+    calculate_gaussian_burstiness,
+    calculate_sigmoid_fluency,
     calculate_vocabulary_entropy,
     reward_length,
     CoherenceRewardModel,
     QualityRewardModel,
     MAGRPORewardEvaluator,
+    MAGRPORewardEvaluatorV2,
     CompositeRewardEngine,
 )
 
@@ -100,11 +104,17 @@ class TestMAGRPORewards(unittest.TestCase):
         self.assertGreater(up3, 900)
 
     def test_anti_context_ratio_verbatim_copy(self):
-        """Verbatim copying of the summary should produce a near-zero novelty score."""
-        summary = "Alice went down the rabbit hole and discovered a magical secret door in the garden."
-        rollout = "Alice went down the rabbit hole and discovered a magical secret door in the garden."
+        """Verbatim copying of a summary without proper nouns should produce exactly 0.0 novelty."""
+        summary = "the animal went down the deep hole and discovered a magical secret door in the garden."
+        rollout = "the animal went down the deep hole and discovered a magical secret door in the garden."
         ratio = calculate_anti_context_ratio(rollout, summary)
         self.assertAlmostEqual(ratio, 0.0, places=4)
+
+        # Verbatim copying with an entity still yields near-zero (<0.1) novelty
+        summary_ent = "Alice went down the rabbit hole and discovered a magical secret door in the garden."
+        rollout_ent = "Alice went down the rabbit hole and discovered a magical secret door in the garden."
+        ratio_ent = calculate_anti_context_ratio(rollout_ent, summary_ent)
+        self.assertLess(ratio_ent, 0.1)
 
     def test_anti_context_ratio_novel_text(self):
         """Completely new narrative should have high novelty (1.0)."""
@@ -201,6 +211,29 @@ class TestMAGRPORewards(unittest.TestCase):
         self.assertIn("r_length", res)
         self.assertIn("r_coherence", res)
         self.assertIn("r_quality", res)
+
+    def test_v2_entity_protection(self):
+        # Summary mentions character "Detective Miller" and place "London"
+        summary = "Detective Miller arrived at London to investigate the incident."
+        entities = extract_entity_trigrams(summary)
+        # Should detect "detective miller arrived", "arrived at london", etc.
+        self.assertTrue(len(entities) > 0)
+
+        # Rollout containing character names should not be penalized to zero
+        rollout = "Detective Miller stepped into the rain and looked across London carefully."
+        ratio = calculate_anti_context_ratio(rollout, summary)
+        self.assertGreater(ratio, 0.4)
+
+    def test_v2_sigmoid_fluency(self):
+        good_text = "The quick brown fox jumps over the lazy dog and enjoys a pleasant morning walk."
+        score = calculate_sigmoid_fluency(good_text)
+        self.assertGreater(score, 0.5)
+
+    def test_v2_gaussian_burstiness(self):
+        text = "Short sentence. Here is a longer sentence with descriptive details that adds texture to the storytelling pacing. Another short one."
+        score = calculate_gaussian_burstiness(text, b_target=11.0, tau_b=4.0)
+        self.assertGreater(score, 0.0)
+        self.assertLessEqual(score, 1.0)
 
 
 if __name__ == "__main__":
