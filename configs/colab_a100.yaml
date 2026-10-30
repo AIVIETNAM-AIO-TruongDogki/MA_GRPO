@@ -36,15 +36,13 @@ rewards:
     w_quality: 0.30
 
   coherence:
-    embedding_model: "BAAI/bge-small-en-v1.5"
+    embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
     tail_words: 150
     head_words: 150
 
   quality:
-    fluency_evaluator: "Qwen/Qwen2.5-0.5B"
-    fluency_sigma_ref: 10.0
-    alpha_fluency: 0.55
-    beta_richness: 0.20
-    gamma_burstiness: 0.25
-    burstiness_mu0: 6.0
-    burstiness_sigma0: 4.0
+    alpha_fluency: 0.40
+    beta_richness: 0.30
+    gamma_burstiness: 0.30
+    burstiness_mu0: 12.0
+    burstiness_sigma0: 6.0
