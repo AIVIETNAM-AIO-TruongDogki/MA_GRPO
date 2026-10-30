@@ -1,16 +1,22 @@
 """
-Unified Intrinsic Reward Engine for MA-GRPO.
+Unified Intrinsic Reward Engine for MA-GRPO (v2 / ma-grpo-proposal-v4.md).
 
 Contains the 3 standardized intrinsic mathematical reward components:
-    1. Length Reward (LongWriter-Style Piecewise with Buffer Zone):
-       r_length(o) = 1.0,                                    if L_lower <= len(o) <= L_upper
+    1. Length Reward (LongWriter-Style Bounded Piecewise with Buffer Zone):
+       r_length(o) = 1.0,                                    if L_lower <= len(o) <= L_upper ([0.85L, 1.15L])
                    = len(o) / L_lower,                       if len(o) < L_lower
-                   = (L_max - len(o)) / (L_max - L_upper),   if len(o) > L_upper
-    2. Coherence & Diversity Reward (Transition Smoothness & Anti-Repetition):
-       r_coherence(o) = CosineSim(End(C_{i-1}), Start(o)) * (|Uniq3Grams(o) \\ 3Grams(s_i)| / |Total3Grams(o)|)
-    3. Quality Reward (Fluency, Vocabulary Entropy, Sentence Burstiness):
-       r_quality(o) = alpha * r_fluency + beta * r_richness + gamma * r_burstiness
-    4. Evaluator Station (MAGRPORewardEvaluator & CompositeRewardEngine) for TRL GRPOTrainer.
+                   = max(0.0, (L_max - len(o)) / (L_max - L_upper)), if len(o) > L_upper (L_max = 2.0L)
+
+    2. Coherence & Diversity Reward (Transition Flow & Scoped Entity Filtering):
+       r_coherence(o_i) = CosineSim(Embed(End(C_{i-1})), Embed(Start(o_i))) *
+                          (|Uniq3Grams(o_i) \\ (3Grams(s_i) \\ Entities)| / |Total3Grams(o_i)|)
+
+    3. Quality Reward (Sigmoid NLL Fluency, Shannon Richness, Target-Gaussian Burstiness):
+       r_quality(o) = alpha * r_fluency (Sigmoid NLL) +
+                      beta  * r_richness (Shannon Vocabulary Entropy) +
+                      gamma * r_burstiness (Gaussian Kernel centered at b_target ≈ 11.0, tau_b = 4.0)
+
+    4. Evaluator Station (MAGRPORewardEvaluatorV2 & CompositeRewardEngine) for TRL GRPOTrainer.
 """
 
 from __future__ import annotations
