@@ -32,7 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.rewards import CompositeRewardEngine
+from src.rewards import CompositeRewardEngine, extract_length_bounds
 
 
 LOG = logging.getLogger("ma_grpo.train")
@@ -153,12 +153,30 @@ class IntrinsicRewardFunctions:
         raw_prompts = kwargs.get("prompts")
         prompt_texts = [_as_text(p) for p in _per_item(raw_prompts, count, "")] if raw_prompts is not None else [""] * count
 
-        # 2. Resolve target_words dynamically from prompt or dataset kwargs
+        # 2. Resolve target_words and (l_lower, l_upper, l_max) dynamically from prompt or dataset kwargs
         kw_targets = kwargs.get("target_words")
+        kw_lowers = kwargs.get("l_lower")
+        kw_uppers = kwargs.get("l_upper")
+        kw_maxes = kwargs.get("l_max")
+
         if kw_targets is not None:
             targets = [int(v) for v in _per_item(kw_targets, count, 1400)]
         else:
             targets = [extract_target_words_from_text(p, 1400) for p in prompt_texts]
+
+        if kw_lowers is not None and kw_uppers is not None:
+            lowers = [int(v) for v in _per_item(kw_lowers, count, 1330)]
+            uppers = [int(v) for v in _per_item(kw_uppers, count, 1470)]
+            maxes = (
+                [int(v) for v in _per_item(kw_maxes, count, 1890)]
+                if kw_maxes is not None
+                else [int(round(u * 1.35)) for u in uppers]
+            )
+        else:
+            bounds = [extract_length_bounds(p, t) for p, t in zip(prompt_texts, targets)]
+            lowers = [b[0] for b in bounds]
+            uppers = [b[1] for b in bounds]
+            maxes = [b[2] for b in bounds]
 
         # 3. Resolve context_summary
         kw_contexts = kwargs.get("context_summary")
@@ -174,19 +192,24 @@ class IntrinsicRewardFunctions:
         else:
             tails = [extract_tail_from_prompt(p) for p in prompt_texts]
 
-        cache_key = (tuple(texts), tuple(targets), tuple(contexts), tuple(tails))
+        cache_key = (tuple(texts), tuple(targets), tuple(lowers), tuple(uppers), tuple(maxes), tuple(contexts), tuple(tails))
         if self._cache_key == cache_key and self._cache_value is not None:
             return self._cache_value
 
         # Records in a GRPO group share a prompt.  Calculate one group at a
         # time when metadata differs, keeping every reward aligned correctly.
         result: Dict[str, List[float]] = {"length": [], "coherence": [], "quality": []}
-        for text, target, context, tail in zip(texts, targets, contexts, tails):
+        for text, target, l_low, l_up, l_m, context, tail in zip(
+            texts, targets, lowers, uppers, maxes, contexts, tails
+        ):
             scores = self.engine.compute_batch_rewards(
                 rollouts=[text],
                 target_length=target,
                 context_summary=context,
                 prev_chapter_tail=tail,
+                l_lower=l_low,
+                l_upper=l_up,
+                l_max=l_m,
             )
             # GRPOTrainer adds the rewards returned by its functions.  Apply
             # the MA-GRPO YAML weights here so this is exactly R_total.

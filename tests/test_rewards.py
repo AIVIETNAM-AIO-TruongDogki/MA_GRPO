@@ -9,6 +9,7 @@ import numpy as np
 
 from src.rewards import (
     calculate_length_reward,
+    extract_length_bounds,
     count_words,
     calculate_anti_context_ratio,
     extract_head_words,
@@ -32,17 +33,57 @@ class TestMAGRPORewards(unittest.TestCase):
         score = calculate_length_reward(text, target)
         self.assertAlmostEqual(score, 1.0, places=4)
 
-    def test_length_reward_half(self):
-        target = 1200
-        text = "word " * 600
-        score = calculate_length_reward(text, target)
-        self.assertAlmostEqual(score, 0.5, places=4)
+    def test_length_reward_piecewise_formula(self):
+        # Explicit bounds: L_lower=1000, L_upper=1200, L_max=1600
+        # 1. Inside target range [L_lower, L_upper] -> 1.0
+        text_inside = "word " * 1100
+        self.assertAlmostEqual(
+            calculate_length_reward(text_inside, l_lower=1000, l_upper=1200, l_max=1600), 1.0, places=4
+        )
+        self.assertAlmostEqual(
+            calculate_length_reward("word " * 1000, l_lower=1000, l_upper=1200, l_max=1600), 1.0, places=4
+        )
+        self.assertAlmostEqual(
+            calculate_length_reward("word " * 1200, l_lower=1000, l_upper=1200, l_max=1600), 1.0, places=4
+        )
 
-    def test_length_reward_excess(self):
-        target = 1200
-        text = "word " * 2400
-        score = calculate_length_reward(text, target)
-        self.assertAlmostEqual(score, 0.0, places=4)
+        # 2. Below L_lower -> len(o) / L_lower
+        text_short = "word " * 500
+        score_short = calculate_length_reward(text_short, l_lower=1000, l_upper=1200, l_max=1600)
+        self.assertAlmostEqual(score_short, 0.5, places=4)
+
+        # 3. Above L_upper -> (L_max - len(o)) / (L_max - L_upper)
+        # Here L_max=1600, L_upper=1200 => denominator = 400. At 1400: (1600 - 1400) / 400 = 0.5
+        text_long = "word " * 1400
+        score_long = calculate_length_reward(text_long, l_lower=1000, l_upper=1200, l_max=1600)
+        self.assertAlmostEqual(score_long, 0.5, places=4)
+
+        # 4. At L_max -> 0.0
+        text_max = "word " * 1600
+        score_max = calculate_length_reward(text_max, l_lower=1000, l_upper=1200, l_max=1600)
+        self.assertAlmostEqual(score_max, 0.0, places=4)
+
+        # 5. Above L_max -> clamped to 0.0
+        text_excess = "word " * 2000
+        score_excess = calculate_length_reward(text_excess, l_lower=1000, l_upper=1200, l_max=1600)
+        self.assertAlmostEqual(score_excess, 0.0, places=4)
+
+    def test_extract_length_bounds(self):
+        prompt1 = "Write between 1300–1400 words telling a story..."
+        low1, up1, max1 = extract_length_bounds(prompt1)
+        self.assertEqual(low1, 1300)
+        self.assertEqual(up1, 1400)
+        self.assertGreater(max1, up1)
+
+        prompt2 = "The story must be between 1,550 and 1,600 words."
+        low2, up2, max2 = extract_length_bounds(prompt2)
+        self.assertEqual(low2, 1550)
+        self.assertEqual(up2, 1600)
+
+        prompt3 = "The story should be at least 900 words long."
+        low3, up3, max3 = extract_length_bounds(prompt3)
+        self.assertEqual(low3, 900)
+        self.assertGreater(up3, 900)
 
     def test_anti_context_ratio_verbatim_copy(self):
         """Verbatim copying of the summary should produce a near-zero novelty score."""

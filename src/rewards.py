@@ -14,8 +14,14 @@ import math
 import re
 from collections import Counter
 from typing import Any, Dict, List, Optional, Set, Tuple
-import numpy as np
-import yaml
+try:
+    import numpy as np
+except ImportError:
+    np = None
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
 
@@ -39,26 +45,136 @@ def count_words(text: str) -> int:
     return len(re.findall(r"\b\w+\b", clean_text))
 
 
-def calculate_length_reward(text: str, target_length: int) -> float:
+def extract_length_bounds(
+    prompt_text: str,
+    target_length: Optional[int] = None,
+    fallback_target: int = 1400,
+    lower_ratio: float = 0.95,
+    upper_ratio: float = 1.05,
+    max_ratio: float = 1.35,
+) -> Tuple[int, int, int]:
     """
-    Computes length reward for a single rollout:
-        R_length(o) = max(0.0, 1.0 - abs(len(o) - L_target) / L_target)
+    Extracts (L_lower, L_upper, L_max) from prompt text or target length.
+    Detects ranges such as:
+      - 'between 1300–1400 words' / 'between 1550 and 1600 words' -> L_lower=1300, L_upper=1400
+      - 'at least 900 words' / 'over 800 words' -> L_lower=900, L_upper=round(900 * 1.20)
+      - 'around 1600 words' -> L_lower=round(1600 * 0.95), L_upper=round(1600 * 1.05)
+    L_max is calculated as L_upper + max(int(round(L_upper * (max_ratio - 1.0))), L_upper - L_lower, 100).
     """
-    if target_length <= 0:
-        raise ValueError(f"target_length must be positive, got {target_length}")
+    if not prompt_text:
+        target = max(1, target_length if target_length and target_length > 0 else fallback_target)
+        l_low = max(1, int(round(target * lower_ratio)))
+        l_up = max(l_low, int(round(target * upper_ratio)))
+        l_max = int(round(l_up + max(int(round(l_up * (max_ratio - 1.0))), l_up - l_low, 100)))
+        return l_low, l_up, l_max
 
+    clean = prompt_text.replace(",", "")
+
+    # 1. Match explicit range: 'between X and Y words' or 'between X to/–/- Y words'
+    match = re.search(r"between\s+(\d+)\s*(?:and|to|–|-)\s*(\d+)\s*words", clean, re.IGNORECASE)
+    if not match:
+        match = re.search(r"(\d+)\s*(?:–|-)\s*(\d+)\s*words", clean, re.IGNORECASE)
+    if match:
+        v1, v2 = int(match.group(1)), int(match.group(2))
+        l_low, l_up = min(v1, v2), max(v1, v2)
+        span = max(l_up - l_low, int(round(l_up * (max_ratio - 1.0))))
+        l_max = int(round(l_up + max(span, 100)))
+        return l_low, l_up, l_max
+
+    # 2. Match minimum constraints: 'at least X words', 'over X words'
+    match = re.search(r"(?:at least|over)\s+(\d+)\s*words", clean, re.IGNORECASE)
+    if match:
+        l_low = int(match.group(1))
+        l_up = int(round(l_low * 1.20))
+        span = max(l_up - l_low, int(round(l_up * (max_ratio - 1.0))))
+        l_max = int(round(l_up + max(span, 100)))
+        return l_low, l_up, l_max
+
+    # 3. Match 'Total Target Length: Approximately X words' or 'around X words' or single number
+    match = re.search(r"Total Target Length:\s*Approximately\s*(\d+)\s*words", clean, re.IGNORECASE)
+    if not match:
+        match = re.search(r"(?:around|about|approximately)\s+(\d+)\s*words", clean, re.IGNORECASE)
+    if not match:
+        match = re.search(r"(\d{3,5})\s*words", clean, re.IGNORECASE)
+
+    if match:
+        target = int(match.group(1))
+    elif target_length and target_length > 0:
+        target = target_length
+    else:
+        target = fallback_target
+
+    l_low = max(1, int(round(target * lower_ratio)))
+    l_up = max(l_low, int(round(target * upper_ratio)))
+    span = max(l_up - l_low, int(round(l_up * (max_ratio - 1.0))))
+    l_max = int(round(l_up + max(span, 100)))
+    return l_low, l_up, l_max
+
+
+def calculate_length_reward(
+    text: str,
+    target_length: int = 1400,
+    l_lower: Optional[int] = None,
+    l_upper: Optional[int] = None,
+    l_max: Optional[int] = None,
+    lower_ratio: float = 0.95,
+    upper_ratio: float = 1.05,
+    max_ratio: float = 1.35,
+) -> float:
+    """
+    Computes piecewise linear length reward r_length(o):
+        r_length(o) = 1.0,                                    if L_lower <= len(o) <= L_upper
+                    = len(o) / L_lower,                       if len(o) < L_lower
+                    = (L_max - len(o)) / (L_max - L_upper),   if len(o) > L_upper
+
+    Clamped to [0.0, 1.0] to prevent negative reward when len(o) >= L_max.
+    """
     actual_len = count_words(text)
     if actual_len == 0:
         return 0.0
 
-    deviation = abs(actual_len - target_length)
-    score = 1.0 - (deviation / float(target_length))
-    return max(0.0, float(score))
+    if l_lower is None or l_upper is None:
+        ref_target = max(1, target_length if target_length > 0 else 1400)
+        if l_lower is None:
+            l_lower = max(1, int(round(ref_target * lower_ratio)))
+        if l_upper is None:
+            l_upper = max(l_lower, int(round(ref_target * upper_ratio)))
+
+    if l_lower <= 0:
+        raise ValueError(f"l_lower must be positive, got {l_lower}")
+    if l_upper < l_lower:
+        l_upper = l_lower
+
+    if l_max is None:
+        span = max(l_upper - l_lower, int(round(l_upper * (max_ratio - 1.0))))
+        l_max = l_upper + max(span, 100)
+    elif l_max <= l_upper:
+        l_max = l_upper + max(1, int(round(l_upper * 0.2)))
+
+    if l_lower <= actual_len <= l_upper:
+        score = 1.0
+    elif actual_len < l_lower:
+        score = actual_len / float(l_lower)
+    else:  # actual_len > l_upper
+        score = (l_max - actual_len) / float(l_max - l_upper)
+
+    return max(0.0, min(1.0, float(score)))
 
 
-def batch_length_rewards(texts: List[str], target_length: int) -> List[float]:
+def batch_length_rewards(
+    texts: List[str],
+    target_length: int = 1400,
+    l_lower: Optional[int] = None,
+    l_upper: Optional[int] = None,
+    l_max: Optional[int] = None,
+) -> List[float]:
     """Computes length rewards for a batch of G rollouts."""
-    return [calculate_length_reward(t, target_length) for t in texts]
+    return [
+        calculate_length_reward(
+            t, target_length, l_lower=l_lower, l_upper=l_upper, l_max=l_max
+        )
+        for t in texts
+    ]
 
 
 
@@ -228,7 +344,12 @@ def calculate_burstiness(
     if len(sentence_lengths) < 2:
         return 0.0
 
-    std_dev = float(np.std(sentence_lengths))
+    if np is not None:
+        std_dev = float(np.std(sentence_lengths))
+    else:
+        import statistics
+
+        std_dev = float(statistics.stdev(sentence_lengths)) if len(sentence_lengths) > 1 else 0.0
     z = (std_dev - mu_0) / (sigma_0 if sigma_0 > 0 else 1.0)
     score = 1.0 / (1.0 + math.exp(-z))
     return min(1.0, max(0.0, float(score)))
@@ -277,7 +398,7 @@ class QualityRewardEvaluator:
         self.model.eval()
 
     def calculate_perplexity(self, texts: List[str]) -> List[float]:
-        """Calculates token-level perplexity for a batch of texts."""
+        """Calculates token-level perplexity for a batch of texts on stripped prose."""
         import torch
 
         if not texts:
@@ -286,12 +407,13 @@ class QualityRewardEvaluator:
         ppl_scores = []
         with torch.no_grad():
             for text in texts:
-                if not text.strip():
+                clean_text = strip_think_tags(text)
+                if not clean_text.strip():
                     ppl_scores.append(100.0)
                     continue
 
                 encodings = self.tokenizer(
-                    text,
+                    clean_text,
                     return_tensors="pt",
                     truncation=True,
                     max_length=2048,
@@ -385,6 +507,9 @@ class CompositeRewardEngine:
         target_length: int,
         context_summary: str,
         prev_chapter_tail: Optional[str] = None,
+        l_lower: Optional[int] = None,
+        l_upper: Optional[int] = None,
+        l_max: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Computes total composite rewards for G candidate rollouts.
@@ -397,7 +522,13 @@ class CompositeRewardEngine:
                 - 'r_quality': List[float]
                 - 'details': sub-components (fluency, richness, burstiness, ppl)
         """
-        r_length = batch_length_rewards(rollouts, target_length)
+        r_length = batch_length_rewards(
+            rollouts,
+            target_length,
+            l_lower=l_lower,
+            l_upper=l_upper,
+            l_max=l_max,
+        )
 
         r_coherence = self.coherence_evaluator.calculate_coherence_rewards(
             rollouts=rollouts,
