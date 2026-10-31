@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation", type=int, default=None)
     parser.add_argument("--group-size", type=int, default=None, help="GRPO candidates per prompt (G).")
     parser.add_argument("--max-completion-tokens", type=int, default=None)
+    parser.add_argument("--save-steps", type=int, default=None, help="Overrides training.save_steps in config.")
     parser.add_argument("--reward-device", default=None, help="e.g. cuda:1, cuda:0, or cpu.")
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--report-to", default="tensorboard", choices=["none", "tensorboard", "wandb"])
@@ -363,8 +364,8 @@ def main() -> None:
         "max_steps": args.max_steps if args.max_steps is not None else int(train_cfg.get("max_steps", 500)),
         "per_device_train_batch_size": args.batch_size,
         "gradient_accumulation_steps": grad_accum,
-        "logging_steps": int(train_cfg.get("logging_steps", 5)),
-        "save_steps": int(train_cfg.get("save_steps", 50)),
+        "logging_steps": int(train_cfg.get("logging_steps", 2)),
+        "save_steps": args.save_steps if args.save_steps is not None else int(train_cfg.get("save_steps", 10)),
         "num_generations": group_size,
         "max_completion_length": max_tokens,
         "beta": float(train_cfg.get("kl_beta", 0.04)),

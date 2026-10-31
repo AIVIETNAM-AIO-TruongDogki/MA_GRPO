@@ -176,7 +176,8 @@ print(f"Prompt Preview:\\n{sample.get('prompt')[:350]}...")
 
 # Cell 6: Train Script
 add_md("""## Bước 6: Khởi chạy / Tiếp tục Huấn luyện Qwen2.5-7B Writing Agent (Auto-Resume Checkpoint)
-- **Auto-Resume**: Tự động phát hiện checkpoint cao nhất trong Drive (`checkpoint-50`, `checkpoint-100`, v.v.).
+- **Auto-Resume**: Tự động phát hiện checkpoint cao nhất trong Drive (`checkpoint-10`, `checkpoint-20`, `checkpoint-50`...).
+- **Checkpoint mỗi 10 steps**: Định kỳ lưu checkpoint sau mỗi 10 steps (`--save-steps 10`).
 - **Rollout $G=4$**: Sinh 4 ứng viên song song cho mỗi prompt.
 - **Hàm thưởng nội tại 3 trục**: Tự động đánh giá bằng toán học/Python thuần trên `cuda:0` mà không cần LLM judge ngoài.
 - **Thời gian dự kiến**: ~1.2 – 1.8 giờ cho 500 steps trên GPU A100.""")
@@ -215,6 +216,7 @@ cmd = f\"\"\"python scripts/train.py \\
     --reward-device cuda:0 \\
     --output-dir {CHECKPOINT_ROOT} \\
     --max-steps {TARGET_MAX_STEPS} \\
+    --save-steps 10 \\
     --batch-size 1 \\
     --gradient-accumulation 4 \\
     --group-size 4 \\

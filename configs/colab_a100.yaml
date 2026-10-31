@@ -21,8 +21,8 @@ training:
   max_steps: 500
   per_device_train_batch_size: 1
   gradient_accumulation_steps: 4
-  logging_steps: 5
-  save_steps: 50
+  logging_steps: 2
+  save_steps: 10
   kl_beta: 0.06
 
 rollout:
