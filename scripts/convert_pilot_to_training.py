@@ -49,14 +49,14 @@ def convert():
             recent_summary = short_mem.get("recent_chapter_summary", item.get("context_state", {}).get("plot_summary", ""))
             recent_tail = short_mem.get("recent_tail_excerpt", "")
 
-            records.append({
-                "prompt": prompt,
-                "target_words": target_words,
-                "context_summary": recent_summary,
-                "prev_chapter_tail": recent_tail,
-                "sample_id": item.get("sample_id", ""),
-                "genre": item.get("genre", ""),
-            })
+            # Retain ALL rich structured fields of dataset_generator
+            enriched = dict(item)
+            enriched["full_training_prompt"] = prompt
+            enriched["prompt"] = prompt
+            enriched["target_words"] = target_words
+            enriched["context_summary"] = recent_summary
+            enriched["prev_chapter_tail"] = recent_tail
+            records.append(enriched)
 
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_FILE, "w", encoding="utf-8") as out:

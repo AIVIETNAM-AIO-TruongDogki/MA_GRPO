@@ -325,6 +325,8 @@ class PilotDatasetGenerator:
                     break
 
                 # 5. Pack into Final Chapter Prompt Package
+                training_prompt = self._build_training_prompt(chapter_plan, context_state)
+                short_mem = context_state.get("short_term_memory", {})
                 sample_package = {
                     "sample_id": f"{p_id}_ch{ch_idx:02d}",
                     "premise_id": p_id,
@@ -340,7 +342,10 @@ class PilotDatasetGenerator:
                     "scenes": chapter_plan["scenes"],
                     "context_state": context_state,
                     "validation_metadata": context_state.get("validation_metadata", {}),
-                    "full_training_prompt": self._build_training_prompt(chapter_plan, context_state),
+                    "full_training_prompt": training_prompt,
+                    "prompt": training_prompt,
+                    "context_summary": short_mem.get("recent_chapter_summary", context_state.get("plot_summary", "")),
+                    "prev_chapter_tail": short_mem.get("recent_tail_excerpt", ""),
                 }
 
                 valid_samples.append(sample_package)

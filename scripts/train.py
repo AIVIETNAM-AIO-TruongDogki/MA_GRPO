@@ -231,28 +231,44 @@ class IntrinsicRewardFunctions:
 
 
 def load_training_dataset(path: str):
-    """Load and validate JSONL while retaining metadata for reward functions."""
+    """Load and validate JSONL while retaining all rich metadata from dataset_generator for reward functions."""
     from datasets import load_dataset
 
     dataset = load_dataset("json", data_files=str(path), split="train")
-    required = {"prompt"}
-    missing = required - set(dataset.column_names)
-    if missing:
-        raise ValueError(f"Dataset is missing required column(s): {', '.join(sorted(missing))}")
+    # Accept either 'prompt' or 'full_training_prompt' from dataset_generator standard output
+    has_prompt = "prompt" in dataset.column_names or "full_training_prompt" in dataset.column_names
+    if not has_prompt:
+        raise ValueError("Dataset must contain either 'prompt' or 'full_training_prompt' column.")
 
     def normalise(row: Dict[str, Any]) -> Dict[str, Any]:
-        prompt = str(row["prompt"]).strip()
+        prompt = str(row.get("prompt") or row.get("full_training_prompt") or "").strip()
         if not prompt:
             raise ValueError("Every training record must have a non-empty prompt.")
         target_words = int(row.get("target_words") or 1200)
         if target_words <= 0:
             raise ValueError("target_words must be a positive integer.")
-        return {
-            "prompt": prompt,
-            "target_words": target_words,
-            "context_summary": str(row.get("context_summary") or ""),
-            "prev_chapter_tail": str(row.get("prev_chapter_tail") or ""),
-        }
+
+        ctx_state = row.get("context_state") or {}
+        short_mem = ctx_state.get("short_term_memory") or {}
+        ctx_summary = str(
+            row.get("context_summary")
+            or short_mem.get("recent_chapter_summary")
+            or ctx_state.get("plot_summary")
+            or ""
+        )
+        prev_tail = str(
+            row.get("prev_chapter_tail")
+            or short_mem.get("recent_tail_excerpt")
+            or ctx_state.get("recent_tail_excerpt")
+            or ""
+        )
+
+        res = dict(row)
+        res["prompt"] = prompt
+        res["target_words"] = target_words
+        res["context_summary"] = ctx_summary
+        res["prev_chapter_tail"] = prev_tail
+        return res
 
     return dataset.map(normalise, desc="Validating MA-GRPO records")
 
