@@ -76,6 +76,21 @@ NEGATION_WORDS = {
     "distrusted", "distrusts", "denied", "denies", "betrayed", "betrays"
 }
 
+COMMON_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
+    "by", "from", "up", "about", "into", "over", "after", "is", "are", "was", "were",
+    "be", "been", "being", "have", "has", "had", "do", "does", "did", "this", "that",
+    "these", "those", "they", "them", "their", "theirs", "themselves", "what", "which",
+    "who", "whom", "it", "its", "itself", "he", "him", "his", "himself", "she", "her",
+    "hers", "herself", "you", "your", "yours", "yourself", "yourselves", "i", "me", "my",
+    "myself", "we", "us", "our", "ours", "ourselves", "chapter", "scene", "part", "story",
+    "events", "begins", "continues", "concludes", "starts", "ends", "further", "must",
+    "will", "would", "shall", "should", "can", "could", "may", "might", "also", "just",
+    "then", "there", "here", "where", "when", "why", "how", "all", "any", "both", "each",
+    "few", "more", "most", "other", "some", "such", "than", "too", "very", "now", "so",
+    "yet", "as", "well", "out", "down", "off", "back", "again", "only", "first", "next"
+}
+
 
 def detect_heuristic_negation_contradictions(
     summary_text: str,
@@ -84,20 +99,19 @@ def detect_heuristic_negation_contradictions(
     """
     Detects potential polarity inversions (e.g. source says 'Elena trusted Marcus',
     summary says 'Elena did not trust Marcus').
+    Filters out common stopwords and scopes search to same-sentence proximity (<= 10 words).
     """
     contradictions = []
     summary_sentences = [s.strip() for s in re.split(r"[.!?]+", summary_text) if s.strip()]
-    source_lower = source_text.lower()
-    source_words = set(re.findall(r"\b\w{3,}\b", source_lower))
+    source_sentences = [s.strip().lower() for s in re.split(r"[.!?\n]+", source_text) if s.strip()]
+    source_words = set(re.findall(r"\b\w{4,}\b", source_text.lower())) - COMMON_STOPWORDS - NEGATION_WORDS
 
     for s_sent in summary_sentences:
         s_words = [w.lower() for w in re.findall(r"\b\w+\b", s_sent)]
-        has_negation = any(nw in s_words for nw in NEGATION_WORDS)
-
-        # Look for content word pairs appearing in both summary and source
         content_words = [
             w for w in s_words
-            if len(w) >= 3 and w not in NEGATION_WORDS and (w in source_words or any(cw.startswith(w[:4]) for cw in source_words))
+            if len(w) >= 4 and w not in NEGATION_WORDS and w not in COMMON_STOPWORDS
+            and (w in source_words or any(cw.startswith(w[:4]) for cw in source_words))
         ]
 
         if len(content_words) >= 2:
@@ -105,19 +119,24 @@ def detect_heuristic_negation_contradictions(
             for i in range(min(4, len(content_words))):
                 for j in range(i + 1, min(i + 3, len(content_words))):
                     w1, w2 = content_words[i], content_words[j]
-                    m_sum = re.search(r"\b" + re.escape(w1) + r"\b(.*?)\b" + re.escape(w2) + r"\b", s_sent.lower())
-                    m_src = re.search(r"\b" + re.escape(w1[:4]) + r"\w*\b(.*?)\b" + re.escape(w2[:4]) + r"\w*\b", source_lower)
+                    # Check summary span between w1 and w2 within <= 8 words
+                    m_sum = re.search(r"\b" + re.escape(w1) + r"\b((?:\W+\w+){0,8}?\W+)\b" + re.escape(w2) + r"\b", s_sent.lower())
+                    if not m_sum:
+                        continue
+                    sum_neg = any(nw in m_sum.group(1).split() for nw in NEGATION_WORDS)
 
-                    if m_sum and m_src:
-                        sum_neg = any(nw in m_sum.group(1).split() for nw in NEGATION_WORDS) or has_negation
-                        src_neg = any(nw in m_src.group(1).split() for nw in NEGATION_WORDS)
-                        if sum_neg != src_neg:
-                            contradictions.append(
-                                f"Polarity clash: Summary sentence '{s_sent}' asserts negation={sum_neg} between '{w1}' and '{w2}', but source asserts negation={src_neg}."
-                            )
-                            break
-                if contradictions:
-                    break
+                    # Look for w1 and w2 in the same source sentence within <= 10 words
+                    for src_sent in source_sentences:
+                        m_src = re.search(r"\b" + re.escape(w1[:4]) + r"\w*\b((?:\W+\w+){0,10}?\W+)\b" + re.escape(w2[:4]) + r"\w*\b", src_sent)
+                        if m_src:
+                            src_neg = any(nw in m_src.group(1).split() for nw in NEGATION_WORDS)
+                            if sum_neg != src_neg:
+                                contradictions.append(
+                                    f"Polarity clash: Summary sentence '{s_sent}' asserts negation={sum_neg} between '{w1}' and '{w2}', but source asserts negation={src_neg}."
+                                )
+                                break
+                    if contradictions:
+                        break
 
     return contradictions
 
@@ -210,7 +229,15 @@ Audit faithfulness (0.0-1.0) and completeness (0.0-1.0).
 
         # Penalty for detected negation contradictions
         if neg_clashes:
-            faith = max(0.0, faith - 0.25 * len(neg_clashes))
+            if self.generate_fn:
+                # LLM validator is active: only heavily penalize if LLM also flagged contradictions;
+                # otherwise apply calibrated minor adjustment to prevent regex false positives from overturning 70B+ LLM judgment.
+                if llm_contradictions:
+                    faith = max(0.0, faith - 0.25 * len(set(neg_clashes) | set(llm_contradictions)))
+                else:
+                    faith = max(0.0, faith - 0.05 * len(neg_clashes))
+            else:
+                faith = max(0.0, faith - 0.25 * len(neg_clashes))
 
         composite = round(0.5 * faith + 0.5 * comp, 3)
         is_valid = composite >= self.threshold

@@ -310,7 +310,9 @@ class PilotDatasetGenerator:
                             "error": f"V_s score {val_meta.get('composite_score')} < threshold",
                             "validation_metadata": val_meta,
                         })
-                        break
+                        # Two-tier Coordinator automatically engages guaranteed structured fallback.
+                        # We record the event for auditing but do NOT abort subsequent chapters,
+                        # preserving narrative continuity across the full chapter sequence.
 
                 except Exception as e:
                     print(f"  [!] Coordinator Failure on Chapter {ch_idx} on {p_id}: {e}")

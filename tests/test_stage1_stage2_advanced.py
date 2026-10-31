@@ -185,15 +185,30 @@ class TestStage1AndStage2Advanced(unittest.TestCase):
     def test_validator_negation_contradiction_detection(self):
         """Detect negation contradiction clashes where summary inverts source polarity."""
         source = "Elena trusted Marcus completely throughout the trial."
-        # Contradictory summary
+        # Contradictory summary (Summary negates, Source affirms)
         contradictory_summary = "Elena did not trust Marcus during the trial."
         clashes = detect_heuristic_negation_contradictions(contradictory_summary, source)
         self.assertTrue(len(clashes) > 0)
+
+        # Contradictory summary (Source negates, Summary affirms)
+        source_neg = "Elena did not trust Marcus during the trial."
+        summary_affirm = "Elena trusted Marcus as they faced the trial."
+        clashes_rev = detect_heuristic_negation_contradictions(summary_affirm, source_neg)
+        self.assertTrue(len(clashes_rev) > 0)
 
         # Valid non-contradictory summary
         valid_summary = "Elena trusted Marcus as they faced the trial."
         clashes_valid = detect_heuristic_negation_contradictions(valid_summary, source)
         self.assertEqual(len(clashes_valid), 0)
+
+        # Stopwords and unrelated clauses must NOT trigger false positives
+        p3_summary = "This revelation sets the stage for their upcoming journey and the challenges they must face."
+        p3_source = "The trial of Horus. Anubis revealed the deeper plan. The journey continued into the subsequent sector."
+        self.assertEqual(len(detect_heuristic_negation_contradictions(p3_summary, p3_source)), 0)
+
+        p4_summary = "Vasquez, realizing these are not random, deduces that an external force is controlling them."
+        p4_source = "Vasquez descended into the trench with her team. She realized that anomalous signals were transmitting."
+        self.assertEqual(len(detect_heuristic_negation_contradictions(p4_summary, p4_source)), 0)
 
     def test_pilot_dataset_generator_run(self):
         """Verify PilotDatasetGenerator runs end-to-end on premises and exports jsonl."""
