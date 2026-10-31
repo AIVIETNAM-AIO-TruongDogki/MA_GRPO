@@ -439,5 +439,17 @@ Unresolved Mysteries: {long_mem.get('unresolved_plot_threads', [])}
 1. Write between {int(0.85 * chapter_plan['target_words'])} and {int(1.15 * chapter_plan['target_words'])} words of rich narrative prose.
 2. Advance through all scene beats in exact chronological sequence.
 3. Conclude the chapter at this turning point: {chapter_plan['exit_state']}.
+
+CRITICAL WRITING INSTRUCTIONS:
+1. Test-Time Reasoning (Chain-of-Thought):
+   You MUST begin your response with a <think>...</think> block containing your step-by-step narrative plan:
+   - Scene-by-scene pacing: Plan word distribution to strictly match each scene's target words.
+   - Narrative transition: Hook directly into the continuation point without verbatim sentence repetition.
+   - Tone & Sensory palette: Outline sensory imagery and avoid literal phrasing from the context summary.
+2. Chapter Prose:
+   Immediately after </think>, output ONLY the final narrative prose.
+   - Seamlessly flow between scenes according to the budgets.
+   - DO NOT include scene labels, section titles, author notes, or meta-commentary outside <think>.
+Begin with <think> now:
 """
         return prompt.strip()
