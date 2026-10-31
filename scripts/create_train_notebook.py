@@ -266,6 +266,38 @@ if os.path.exists(BENCHMARK_OUTPUT_CSV):
     print(df.to_string(index=False))
 """)
 
+# Cell 8: Direct Inference & Benchmark Comparison: Base Qwen vs Checkpoint-10
+add_md("""## Bước 8: Đối sánh trực diện Inference & Benchmark: Qwen Chưa train vs Qwen Checkpoint-10
+- Sinh văn bản trên **cùng 1 prompt mẫu** bằng cả 2 mô hình:
+  1. **Qwen2.5-7B Base** (chưa qua fine-tuning RL)
+  2. **Qwen2.5-7B MA-GRPO (Checkpoint-10)** (đã tối ưu 10 steps bằng 3 hàm thưởng)
+- Đo lường và in ra Bảng đối sánh trực tiếp các chỉ số:
+  - Độ dài thực tế vs Target ($S_l$ %)
+  - Độ phong phú từ vựng (Distinct-3, Distinct-4 %)
+  - Độ mượt tự nhiên (PPL)
+  - Đối chiếu cùng StoryWriter, Agents' Room, LongWriter-Zero.""")
+add_code("""import os
+import glob
+import re
+
+CKPT_10_DIR = f"{CHECKPOINT_ROOT}/checkpoint-10"
+
+# Nếu checkpoint-10 chưa có, tự động lấy checkpoint đầu tiên hoặc cao nhất hiện có
+if not os.path.exists(CKPT_10_DIR):
+    checkpoint_dirs = glob.glob(os.path.join(CHECKPOINT_ROOT, "checkpoint-*"))
+    if checkpoint_dirs:
+        CKPT_10_DIR = sorted(checkpoint_dirs, key=lambda x: int(re.search(r"checkpoint-(\\d+)", x).group(1)) if re.search(r"checkpoint-(\\d+)", x) else 0)[0]
+
+print(f"🎯 Thực hiện Inference & Benchmark so sánh Base Model vs: {CKPT_10_DIR}")
+
+!python scripts/compare_base_vs_checkpoint.py \\
+    --checkpoint {CKPT_10_DIR} \\
+    --base-model Qwen/Qwen2.5-7B-Instruct \\
+    --dataset data/chapters.jsonl \\
+    --samples 1 \\
+    --output /content/drive/MyDrive/MA-GRPO-Checkpoints/compare_base_vs_ckpt10.csv
+""")
+
 OUTPUT_NB.parent.mkdir(parents=True, exist_ok=True)
 with open(OUTPUT_NB, "w", encoding="utf-8") as f:
     json.dump(nb, f, indent=1, ensure_ascii=False)
