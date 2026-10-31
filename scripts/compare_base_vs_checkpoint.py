@@ -268,12 +268,17 @@ def run_comparison(
         {"Model / Method": "Self-Lengthen", "Length Sl (%)": 87.13, "Distinct-3 (%)": 92.48, "Distinct-4 (%)": 95.95, "PPL ↓": 4.76},
         {"Model / Method": "LongWriter-Zero-32B", "Length Sl (%)": 91.50, "Distinct-3 (%)": 96.20, "Distinct-4 (%)": 98.10, "PPL ↓": 4.95},
         {"Model / Method": "Qwen2.5-7B (Base - Chưa train)", "Length Sl (%)": b_mean_sl, "Distinct-3 (%)": b_mean_d3, "Distinct-4 (%)": b_mean_d4, "PPL ↓": b_mean_ppl},
-        {"Model / Method": "⭐ MA-GRPO Qwen (Checkpoint-10)", "Length Sl (%)": c_mean_sl, "Distinct-3 (%)": c_mean_d3, "Distinct-4 (%)": c_mean_d4, "PPL ↓": c_mean_ppl},
     ]
+    if has_lora:
+        ckpt_label = f"⭐ MA-GRPO Qwen ({os.path.basename(checkpoint_dir)})"
+        comp_rows.append({"Model / Method": ckpt_label, "Length Sl (%)": c_mean_sl, "Distinct-3 (%)": c_mean_d3, "Distinct-4 (%)": c_mean_d4, "PPL ↓": c_mean_ppl})
 
     df_comp = pd.DataFrame(comp_rows)
     print("\n" + "=" * 90)
-    print("BẢNG ĐỐI SÁNH TRỰC DIỆN: QWEN CHƯA TRAIN vs QWEN CHECKPOINT-10 vs SOTA BASELINES")
+    if has_lora:
+        print(f"BẢNG ĐỐI SÁNH TRỰC DIỆN: QWEN CHƯA TRAIN vs {os.path.basename(checkpoint_dir).upper()} vs SOTA BASELINES")
+    else:
+        print("BẢNG ĐÁNH GIÁ BENCHMARK: QWEN CHƯA TRAIN (ZERO-SHOT) vs SOTA BASELINES")
     print("=" * 90)
     print(df_comp.to_string(index=False))
 
@@ -297,3 +302,4 @@ if __name__ == "__main__":
         num_samples=args.samples,
         output_csv=args.output,
     )
+
