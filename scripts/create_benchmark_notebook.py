@@ -45,11 +45,19 @@ def add_code(code):
 
 # Header
 add_md("""# 📊 MA-GRPO: Benchmark & Inference Evaluation (Base Qwen vs Checkpoint)
-### Đánh giá định lượng & Trực quan hóa văn phong của Qwen2.5-7B
+### Đánh giá định lượng & Trực quan hóa văn phong của Qwen2.5-7B trên tập 5 Prompt Chuẩn của Benchmark 8 Models
+
 **Mục tiêu**:
-1. **Kiểm tra Qwen Chưa Train (Base Zero-Shot)**: Đánh giá xem khi chưa có RL, mô hình đạt bao nhiêu từ, độ tuân thủ độ dài $S_l$, độ phong phú vốn từ Distinct-3/4, và Perplexity (PPL).
-2. **Đối sánh Trực diện với Checkpoint (đã train)**: So sánh trước và sau khi được tối ưu bằng 3 hàm thưởng nội tại ($R_{\\text{length}}, R_{\\text{coherence}}, R_{\\text{quality}}$).
-3. **So sánh với SOTA**: Đối chiếu cùng StoryWriter, Agents' Room, LongWriter-Zero-32B.
+1. **Kiểm tra Qwen Chưa Train (Base Zero-Shot)**: Đánh giá xem khi chưa qua fine-tuning RL, mô hình đạt bao nhiêu từ, độ tuân thủ độ dài $S_l$, độ phong phú vốn từ Distinct-3/4, và Perplexity (PPL).
+2. **Đúng 5 Prompt Benchmark Kinh Điển (tell-me-a-story-test)**:
+   - `example_000`: Thần Horus & bình canopic (Target: 1.350 từ)
+   - `example_001`: Thần Apollo & lời nguyền tiên tri (Target: 1.575 từ)
+   - `example_002`: Nhân vật thần thoại Hy Lạp trong quán cà phê (Target: 1.900 từ)
+   - `example_003`: Nghi thức triệu hồi nữ thần Freya (Target: 1.600 từ)
+   - `example_004`: Nhạc sĩ Orpheus tại New York (Target: 900 từ)
+3. **Đối sánh Trực diện với Checkpoint (đã train)**: So sánh trước và sau khi được tối ưu bằng 3 hàm thưởng nội tại ($R_{\\text{length}}, R_{\\text{coherence}}, R_{\\text{quality}}$).
+4. **Đối chiếu Trực tiếp với Bảng 8 SOTA Baselines**: StoryWriter, Agents' Room, Self-Lengthen, LongWriter-Zero-32B, MA-GRPO-50, MA-GRPO-100.
+
 *Lưu ý: Notebook này thuần túy phục vụ Inference & Đánh giá Benchmark, không chạy vòng lặp Training.*
 """)
 
@@ -68,17 +76,17 @@ if torch.cuda.is_available():
 """)
 
 # Cell 2: Google Drive
-add_md("""## Bước 2: Kết nối Google Drive (Để đọc Checkpoint nếu có)""")
+add_md("""## Bước 2: Kết nối Google Drive (Để nạp Checkpoint đã train nếu có)""")
 add_code("""from google.colab import drive
 import os
 
 drive.mount('/content/drive')
 CHECKPOINT_ROOT = "/content/drive/MyDrive/MA-GRPO-Checkpoints/qwen-7b-final"
-print(f"Đường dẫn Checkpoint: {CHECKPOINT_ROOT}")
+print(f"Thư mục Checkpoints trên Drive: {CHECKPOINT_ROOT}")
 """)
 
 # Cell 3: Clone repo
-add_md("""## Bước 3: Nạp mã nguồn & Dataset `MA-GRPO`""")
+add_md("""## Bước 3: Nạp mã nguồn `MA-GRPO`""")
 add_code("""import os
 import sys
 
@@ -106,29 +114,48 @@ add_code("""!pip install -q --upgrade pip
 print("✅ Cài đặt thư viện hoàn tất!")
 """)
 
-# Cell 5: Benchmark Qwen Chưa Train (Zero-Shot)
-add_md("""## Bước 5: Benchmark & Inference QWEN CHƯA TRAIN (Base Model Zero-Shot)
+# Cell 5: Inspect Canonical 5 Benchmark Prompts
+add_md("""## Bước 5: Xem trước 5 Prompt Chuẩn của Benchmark 8 Models
+Kiểm tra nội dung 5 prompt kinh điển (`example_000` đến `example_004`) từ tập dữ liệu `tell-me-a-story-test.jsonl`:""")
+add_code("""from scripts.compare_base_vs_checkpoint import load_test_prompts
+
+# Nạp 5 prompt benchmark chuẩn
+benchmark_prompts = load_test_prompts("8models", num_samples=5)
+print(f"✅ Đã nạp thành công {len(benchmark_prompts)} prompt benchmark chuẩn:\\n")
+for p in benchmark_prompts:
+    print(f"📌 [{p['id']}] - Target Length: {p['target_length']} words")
+    print(f"   Premise: {p['prompt'][:140]}...\\n")
+""")
+
+# Cell 6: Benchmark Qwen Chưa Train (Zero-Shot) on Canonical Prompts
+add_md("""## Bước 6: Benchmark & Inference QWEN CHƯA TRAIN (Base Model Zero-Shot)
 - Nạp `Qwen/Qwen2.5-7B-Instruct` nguyên bản (chưa qua fine-tuning RL).
-- Sinh văn bản trên mẫu từ `data/chapters.jsonl` (Target: 1.200 từ).
+- Sinh văn bản trên **5 prompt benchmark chuẩn** (`example_000` đến `example_004`).
+  *(Có thể chọn `NUM_SAMPLES = 5` để chạy đủ 5 prompt hoặc `NUM_SAMPLES = 3` để khớp đúng 3 prompt đầu có Target trung bình 1.608,3 từ như bảng 8 models)*.
 - Đo lường và in ra:
-  - Số lượng từ thực tế và trích đoạn văn bản.
-  - Điểm tuân thủ độ dài $S_l$ (%), độ đa dạng 3-gram Distinct-3 (%), độ mượt mà PPL.
-  - Bảng so sánh với các baseline SOTA.""")
-add_code("""# Chạy đánh giá Base Model Chưa Train
+  - Độ dài thực tế và trích đoạn mở đầu/kết thúc câu chuyện.
+  - Kiểm tra mô hình có sinh `<think>` test-time planning hay không.
+  - Điểm tuân thủ độ dài $S_l$ (%), độ đa dạng 3-gram/4-gram Distinct-3/4 (%), độ mượt mà Perplexity (PPL ↓).
+  - Bảng tổng hợp đối sánh trực tiếp với 8 mô hình SOTA.""")
+add_code("""# Cấu hình số mẫu muốn benchmark (5 mẫu đầy đủ hoặc 3 mẫu chuẩn)
+NUM_SAMPLES = 5
+
+# Chạy đánh giá Base Model Chưa Train trên 5 prompt chuẩn
 !python scripts/compare_base_vs_checkpoint.py \\
     --checkpoint none \\
     --base-model Qwen/Qwen2.5-7B-Instruct \\
-    --dataset data/chapters.jsonl \\
-    --samples 1 \\
+    --dataset 8models \\
+    --samples {NUM_SAMPLES} \\
     --output /content/benchmark_qwen_base_zeroshot.csv
 """)
 
-# Cell 6: Compare Base vs Checkpoint-10
-add_md("""## Bước 6: Đối sánh Trực diện: Qwen Chưa Train vs Qwen Checkpoint (Khi đã có Checkpoint)
+# Cell 7: Compare Base vs Checkpoint-10 on Canonical Prompts
+add_md("""## Bước 7: Đối sánh Trực diện: Qwen Chưa Train vs Qwen Checkpoint (Khi đã có Checkpoint)
 - Tự động phát hiện checkpoint (ví dụ `checkpoint-10`, `checkpoint-20`...) trong Google Drive.
-- Sinh trên cùng 1 prompt mẫu để so sánh:
-  - Xem văn bản của Checkpoint-10 dài ra bao nhiêu từ so với Base Model.
-  - Bảng so sánh chỉ số $S_l$, Distinct-3, Distinct-4, PPL đối đầu trực tiếp.""")
+- Sinh trên **cùng các prompt benchmark chuẩn** để so sánh trực diện:
+  - Xem văn bản của Checkpoint dài ra bao nhiêu từ so với Base Model.
+  - So sánh tư duy lập dàn ý `<think>` giữa 2 phiên bản.
+  - Bảng đối đầu trực tiếp chỉ số $S_l$, Distinct-3, Distinct-4, PPL, BLEU-4, ROUGE-L so với 8 mô hình SOTA.""")
 add_code("""import os
 import glob
 import re
@@ -142,16 +169,16 @@ if not os.path.exists(CKPT_DIR):
         CKPT_DIR = sorted(
             checkpoint_dirs,
             key=lambda x: int(re.search(r"checkpoint-(\\d+)", x).group(1)) if re.search(r"checkpoint-(\\d+)", x) else 0
-        )[0]
+        )[-1]
 
 print(f"🎯 Thực hiện đối sánh Base Model vs Checkpoint: {CKPT_DIR}")
 
-# 2. Chạy đối sánh trực diện
+# 2. Chạy đối sánh trực diện trên cùng tập 5 prompt chuẩn
 !python scripts/compare_base_vs_checkpoint.py \\
     --checkpoint {CKPT_DIR} \\
     --base-model Qwen/Qwen2.5-7B-Instruct \\
-    --dataset data/chapters.jsonl \\
-    --samples 1 \\
+    --dataset 8models \\
+    --samples {NUM_SAMPLES} \\
     --output /content/drive/MyDrive/MA-GRPO-Checkpoints/compare_base_vs_checkpoint.csv
 """)
 
@@ -159,4 +186,4 @@ OUTPUT_NB.parent.mkdir(parents=True, exist_ok=True)
 with open(OUTPUT_NB, "w", encoding="utf-8") as f:
     json.dump(nb, f, indent=1, ensure_ascii=False)
 
-print(f"Successfully created: {OUTPUT_NB}")
+print(f"Successfully generated: {OUTPUT_NB}")
