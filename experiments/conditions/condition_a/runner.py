@@ -18,7 +18,7 @@ def generate_direct_story(
     target_words: int = 10000,
     temperature: float = 0.7,
     top_p: float = 0.9,
-    max_tokens: int = 4096,
+    max_tokens: int = 32768,
 ) -> str:
     """Single-turn direct generation without planning scaffold."""
     prompt = (
@@ -71,7 +71,7 @@ def run_condition_a(
         target_words=total_target_words,
         temperature=temperature,
         top_p=top_p,
-        max_tokens=min(8192, max(2048, int(total_target_words * 1.35))),
+        max_tokens=pipeline.writing_policy.max_model_len,
     )
     gen_lat = round(time.time() - t_gen0, 2)
     return {

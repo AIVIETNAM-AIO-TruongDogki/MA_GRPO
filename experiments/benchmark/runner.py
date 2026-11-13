@@ -77,6 +77,7 @@ def _hf_chat_completion(
     max_tokens: int,
     temperature: float,
     top_p: float,
+    max_model_len: Optional[int] = None,
 ) -> str:
     """Shared HuggingFace Transformers chat generation helper for Planner/Writer/Judge."""
     import torch
@@ -89,11 +90,15 @@ def _hf_chat_completion(
         messages, tokenize=False, add_generation_prompt=True
     )
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+    safe_max_tokens = max_tokens
+    if max_model_len is not None and max_model_len > 0:
+        prompt_tokens = int(inputs["input_ids"].shape[1])
+        safe_max_tokens = max(1, min(max_tokens, max_model_len - prompt_tokens - 32))
     do_sample = temperature > 0.05
     with torch.no_grad():
         out = model.generate(
             **inputs,
-            max_new_tokens=max_tokens,
+            max_new_tokens=safe_max_tokens,
             do_sample=do_sample,
             temperature=temperature if do_sample else None,
             top_p=top_p if do_sample else None,
@@ -154,12 +159,20 @@ class LocalGenerationBackend:
 
             def _hf_chat(system_prompt: str, user_prompt: str, max_tokens: int, temp: float, top_p: float) -> str:
                 return _hf_chat_completion(
-                    self._hf_model, self._hf_tokenizer, system_prompt, user_prompt, max_tokens, temp, top_p
+                    self._hf_model,
+                    self._hf_tokenizer,
+                    system_prompt,
+                    user_prompt,
+                    max_tokens,
+                    temp,
+                    top_p,
+                    max_model_len=self.max_model_len,
                 )
 
-            self.planner_llm_fn = lambda sys_p, usr_p: _hf_chat(sys_p, usr_p, 1024, 0.4, 0.9)
+            self.planner_llm_fn = lambda sys_p, usr_p: _hf_chat(sys_p, usr_p, 4096, 0.4, 0.9)
             self.writing_policy = VLLMWritingPolicy(
                 model_name=self.model_name,
+                max_model_len=self.max_model_len,
                 use_mock=False,
                 dtype=self.dtype,
                 custom_generate_fn=lambda prompt, max_tok, temp, top_p: _hf_chat("", prompt, max_tok, temp, top_p),
@@ -191,7 +204,7 @@ class LocalGenerationBackend:
                 params = SamplingParams(
                     temperature=0.4,
                     top_p=0.9,
-                    max_tokens=self.writing_policy._clamp_max_tokens(prompt_text, 1024),
+                    max_tokens=self.writing_policy._clamp_max_tokens(prompt_text, 4096),
                 )
                 outputs = vllm_engine.generate([prompt_text], params)
                 return outputs[0].outputs[0].text.strip()
@@ -256,7 +269,7 @@ class LocalJudgeBackend:
         api_base: Optional[str] = None,
         dtype: str = "auto",
         gpu_memory_utilization: float = 0.85,
-        max_model_len: int = 12288,
+        max_model_len: int = 16384,
     ):
         self.judge_backend = judge_backend
         self.judge_model = judge_model
@@ -308,7 +321,7 @@ class LocalJudgeBackend:
                     add_generation_prompt=True,
                 )
                 prompt_tokens = len(tok.encode(prompt_text, add_special_tokens=False))
-                safe_max = max(64, min(768, max_model_len - prompt_tokens - 32))
+                safe_max = max(64, min(2048, max_model_len - prompt_tokens - 32))
                 params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=safe_max)
                 outputs = self._vllm.generate([prompt_text], params)
                 return outputs[0].outputs[0].text.strip()
@@ -333,7 +346,14 @@ class LocalJudgeBackend:
             )
             self._hf_model.eval()
             self.judge_fn = lambda sys_p, usr_p: _hf_chat_completion(
-                self._hf_model, self._hf_tokenizer, sys_p, usr_p, 768, 0.0, 1.0
+                self._hf_model,
+                self._hf_tokenizer,
+                sys_p,
+                usr_p,
+                2048,
+                0.0,
+                1.0,
+                max_model_len=max_model_len,
             )
             return
 
@@ -1006,8 +1026,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--backend", choices=["mock", "hf", "vllm"], default="mock")
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--dtype", default="auto")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.65)
-    parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.80)
+    parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--nli-model", default="MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")
     parser.add_argument("--track1-data", default=None, help="Path to LONGSTORY/BookSum/PG-19 JSONL")
     parser.add_argument("--track2-data", default=None, help="Path to TELL ME A STORY JSONL")
@@ -1030,7 +1050,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--judge-api-base", default=None)
     parser.add_argument("--judge-model", default="gpt-4o-mini")
     parser.add_argument("--judge-gpu-memory-utilization", type=float, default=0.85)
-    parser.add_argument("--judge-max-model-len", type=int, default=12288)
+    parser.add_argument("--judge-max-model-len", type=int, default=16384)
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "benchmark_outputs"))
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
@@ -1039,6 +1059,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
     args = parse_args(argv)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

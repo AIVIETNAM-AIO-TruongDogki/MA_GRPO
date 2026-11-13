@@ -523,6 +523,12 @@ class TestPipelineEndToEndConditions(unittest.TestCase):
         self.assertEqual(clamped, 8192 - 200 - 32)
         self.assertLessEqual(200 + clamped, 8192)
 
+        # Max-ping uncapped default (32768) still stays strictly inside max_model_len
+        policy_32k = VLLMWritingPolicy(use_mock=True)
+        self.assertEqual(policy_32k.max_model_len, 32768)
+        policy_32k.llm = _StubLLM()
+        self.assertEqual(policy_32k._clamp_max_tokens(prompt_200, 32768), 32768 - 200 - 32)
+
     def test_local_judge_resolution_and_json_resilience(self):
         from experiments.benchmark.evaluator import LLMJudge5DimEvaluator
         from experiments.benchmark.runner import parse_args, resolve_judge_runtime

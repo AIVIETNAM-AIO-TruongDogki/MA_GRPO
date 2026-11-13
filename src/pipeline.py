@@ -63,7 +63,7 @@ class VLLMWritingPolicy:
         model_name: str = "Qwen/Qwen2.5-7B-Instruct",
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.65,
-        max_model_len: int = 8192,
+        max_model_len: int = 32768,
         dtype: str = "auto",
         use_mock: bool = False,
         custom_generate_fn: Optional[Callable[[str, int, float, float], str]] = None,
@@ -394,7 +394,7 @@ class MAGRPOPipeline:
                 context_summary=context_summary,
                 temperature=temperature,
                 top_p=top_p,
-                max_tokens=max(1600, int(ch_plan.get("target_words", 1200) * 1.45)),
+                max_tokens=self.writing_policy.max_model_len,
                 enable_cot=enable_cot,
             )
             generated_chapters.append(chapter_prose)
@@ -461,7 +461,7 @@ class MAGRPOPipeline:
             chapter_prose = self.writing_policy.generate_chapter_prose(
                 chapter_plan=ch_plan,
                 context_summary=context_summary,
-                max_tokens=int(ch_plan.get("target_words", 1200) * 1.3),
+                max_tokens=self.writing_policy.max_model_len,
             )
 
             generated_chapters.append(chapter_prose)

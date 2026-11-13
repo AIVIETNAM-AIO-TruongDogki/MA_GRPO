@@ -95,7 +95,7 @@ def run_condition_b(
             target_words=ch["target_words"],
             temperature=temperature,
             top_p=top_p,
-            max_tokens=max(1600, int(ch["target_words"] * 1.45)),
+            max_tokens=pipeline.writing_policy.max_model_len,
         )
         generated_chapters.append(seg)
         recent_tail = " ".join(seg.split()[-180:])
