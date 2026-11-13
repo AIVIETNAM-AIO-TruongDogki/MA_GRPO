@@ -1,6 +1,59 @@
+# Python / Packaging
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Jupyter & IDE
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets / Local Config
+.env
+.env.*
+*.pem
+*.key
+
+# Model Checkpoints, Weights & Training Artifacts
 checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+logs/
 *.log
+runs/
+wandb/
+.cache/
+hf_cache/
+
+# Benchmark Outputs & Temporary Archives
+benchmark_outputs/
+outputs/
+output/
+results/
+staging_zip/
+*.tmp
+*.zip
+*.tar.gz
+*.parquet
+
+# Raw oversize downloads (curated data/*.jsonl remain tracked)
+data/raw/

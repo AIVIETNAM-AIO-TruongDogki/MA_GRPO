@@ -1,18 +1,23 @@
 """
-End-to-End Orchestrator Pipeline for MA-GRPO with vLLM Integration.
-Optimized for high-throughput generation on Server 40GB (A100 / A6000 / L40).
-Supports:
-    1. Single chapter inference via vLLM PagedAttention.
-    2. Parallel rollout generation (n=G) for GRPO training.
-    3. Seamless mock fallback for offline local unit testing.
+End-to-End Orchestrator Pipeline for MA-GRPO with vLLM / HF / Mock Integration.
+Core Paper Architecture:
+    1. Hardware-aware precision (bfloat16 on Ampere/Hopper A100/H100/4090, float16 on T4/V100).
+    2. Single-chapter inference and parallel GRPO rollouts (n=G) via vLLM PagedAttention.
+    3. Clean Stage-1 Macro Planning -> Stage-2 Two-Tier Coordinator & Writing Policy execution.
 """
 
+from __future__ import annotations
+
 import re
-from typing import Any, Callable, Dict, List, Optional, Tuple
 import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .coordinator import CoordinatorAgent
-from .planning import OutlineAgent, PlanningAgent
+from .planning import (
+    OutlineAgent,
+    PlanningAgent,
+    estimate_token_count,
+)
 from .rewards import count_words, strip_think_tags
 
 
@@ -33,11 +38,24 @@ def extract_cot_and_prose(text: str) -> Tuple[str, str]:
     return cot_text, prose_text
 
 
+def resolve_optimal_dtype(preferred: str = "auto") -> str:
+    """Resolve bfloat16 on Ampere+ GPUs (A100/H100/4090) and float16 on Turing (T4)."""
+    if preferred in {"bfloat16", "float16", "float32"}:
+        return preferred
+    try:
+        import torch
+        if torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability(0)
+            return "bfloat16" if major >= 8 else "float16"
+    except Exception:
+        pass
+    return "float16"
+
+
 class VLLMWritingPolicy:
     """
-    vLLM-backed Writing Policy for ultra-fast chapter generation and GRPO rollouts.
-    Takes full advantage of 40GB VRAM via PagedAttention and FlashAttention-2.
-    Integrates Test-Time Scaling (<think>...</think> reasoning) and scene-level word budgets.
+    Writing Policy supporting vLLM, custom HuggingFace/API callback, or mock generation.
+    Supports Condition A (Direct), Condition B (Unstructured), and Conditions C/D/E (Structured).
     """
 
     def __init__(
@@ -46,20 +64,27 @@ class VLLMWritingPolicy:
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.65,
         max_model_len: int = 8192,
+        dtype: str = "auto",
         use_mock: bool = False,
+        custom_generate_fn: Optional[Callable[[str, int, float, float], str]] = None,
     ):
         self.model_name = model_name
         self.use_mock = use_mock
+        self.custom_generate_fn = custom_generate_fn
         self.llm = None
+        self.dtype = resolve_optimal_dtype(dtype)
 
-        if not self.use_mock:
+        if not self.use_mock and self.custom_generate_fn is None:
             try:
                 from vllm import LLM
-                print(f"[vLLM] Initializing engine with model: {model_name} (bfloat16, VRAM limit: {gpu_memory_utilization*100}%)...")
+                print(
+                    f"[vLLM] Initializing engine with model: {model_name} "
+                    f"({self.dtype}, VRAM limit: {gpu_memory_utilization * 100}%)..."
+                )
                 self.llm = LLM(
                     model=model_name,
                     tensor_parallel_size=tensor_parallel_size,
-                    dtype="bfloat16",
+                    dtype=self.dtype,
                     gpu_memory_utilization=gpu_memory_utilization,
                     max_model_len=max_model_len,
                     trust_remote_code=True,
@@ -68,6 +93,47 @@ class VLLMWritingPolicy:
                 print(f"[vLLM] Warning: vLLM engine unavailable ({e}). Falling back to mock generator.")
                 self.use_mock = True
 
+    def _format_vllm_prompt(self, prompt: str) -> str:
+        """Apply model chat template when supported by vLLM tokenizer."""
+        if self.llm is None:
+            return prompt
+        try:
+            tok = self.llm.get_tokenizer()
+            if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None):
+                return tok.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+        except Exception:
+            pass
+        return prompt
+
+    def generate_raw(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        mock_fn: Optional[Callable[[], str]] = None,
+    ) -> str:
+        """Execute single-prompt generation via custom callback, vLLM, or mock fallback."""
+        if self.custom_generate_fn is not None:
+            return self.custom_generate_fn(prompt, max_tokens, temperature, top_p)
+        if self.use_mock or self.llm is None:
+            return mock_fn() if mock_fn is not None else ""
+        from vllm import SamplingParams
+
+        formatted = self._format_vllm_prompt(prompt)
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            presence_penalty=0.1,
+        )
+        outputs = self.llm.generate([formatted], sampling_params)
+        return outputs[0].outputs[0].text
+
     def generate_chapter_prose(
         self,
         chapter_plan: Dict[str, Any],
@@ -75,28 +141,20 @@ class VLLMWritingPolicy:
         temperature: float = 0.85,
         top_p: float = 0.95,
         max_tokens: int = 2200,
+        enable_cot: bool = True,
     ) -> str:
         """
-        Generates prose for a single chapter using vLLM with Test-Time CoT reasoning.
-        Returns strictly the clean narrative prose (post-</think>).
+        Generates prose for a single structured chapter plan.
+        Returns strictly clean narrative prose (post-</think>).
         """
-        prompt = self.construct_prompt(chapter_plan, context_summary)
-
-        if self.use_mock or self.llm is None:
-            raw_output = self._mock_prose(chapter_plan, context_summary)
-        else:
-            from vllm import SamplingParams
-
-            sampling_params = SamplingParams(
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                presence_penalty=0.1,
-            )
-
-            outputs = self.llm.generate([prompt], sampling_params)
-            raw_output = outputs[0].outputs[0].text
-
+        prompt = self.construct_prompt(chapter_plan, context_summary, enable_cot=enable_cot)
+        raw_output = self.generate_raw(
+            prompt,
+            max_tokens,
+            temperature,
+            top_p,
+            lambda: self._mock_prose(chapter_plan, context_summary),
+        )
         _, prose_text = extract_cot_and_prose(raw_output)
         return prose_text if prose_text else raw_output.strip()
 
@@ -110,13 +168,12 @@ class VLLMWritingPolicy:
         max_tokens: int = 2200,
         return_cot: bool = False,
     ) -> List[str]:
-        """
-        Generates G candidate rollouts in parallel for GRPO training.
-        Uses vLLM's native parallel sampling (n=group_size) for extreme throughput.
-        """
+        """Generates G candidate rollouts in parallel for GRPO training."""
         prompt = self.construct_prompt(chapter_plan, context_summary)
 
-        if self.use_mock or self.llm is None:
+        if self.custom_generate_fn is not None:
+            raw_outputs = [self.custom_generate_fn(prompt, max_tokens, temperature, top_p) for _ in range(group_size)]
+        elif self.use_mock or self.llm is None:
             raw_outputs = [self._mock_prose(chapter_plan, context_summary) for _ in range(group_size)]
         else:
             from vllm import SamplingParams
@@ -129,7 +186,8 @@ class VLLMWritingPolicy:
                 presence_penalty=0.1,
             )
 
-            outputs = self.llm.generate([prompt], sampling_params)
+            formatted = self._format_vllm_prompt(prompt)
+            outputs = self.llm.generate([formatted], sampling_params)
             raw_outputs = [o.text.strip() for o in outputs[0].outputs]
 
         if return_cot:
@@ -141,7 +199,12 @@ class VLLMWritingPolicy:
             cleaned.append(prose if prose else raw)
         return cleaned
 
-    def construct_prompt(self, chapter_plan: Dict[str, Any], context_summary: Dict[str, Any]) -> str:
+    def construct_prompt(
+        self,
+        chapter_plan: Dict[str, Any],
+        context_summary: Dict[str, Any],
+        enable_cot: bool = True,
+    ) -> str:
         recent_tail = context_summary.get("recent_tail_excerpt", "")
         tail_ref = (
             f"\n[PRECEDING SCENE CONTINUATION (Pick up immediately from this scene)]:\n{recent_tail}\n"
@@ -150,34 +213,48 @@ class VLLMWritingPolicy:
         )
         active_chars = chapter_plan.get("characters_active", ["Protagonist"])
         scene_outline = chapter_plan.get("scene_outline", [])
-        outline_str = "\n- ".join(scene_outline)
+        outline_str = "\n- ".join(scene_outline) if scene_outline else chapter_plan.get("chapter_goal", "")
         target_words = chapter_plan.get("target_words", 1200)
+        story_arc = chapter_plan.get("story_arc")
+        arc_line = f"\nNarrative Arc Stage: {story_arc}" if story_arc else ""
+        conflict_directive = (
+            f"\n[DIRECTIVE WARNING]: {chapter_plan['injected_contradiction']}"
+            if chapter_plan.get("injected_contradiction")
+            else ""
+        )
 
-        return f"""You are an elite literary novelist. Write the complete narrative prose for {chapter_plan.get('chapter_title', 'Chapter')}.
+        cot_instructions = (
+            "CRITICAL WRITING INSTRUCTIONS:\n"
+            "1. Test-Time Reasoning (Chain-of-Thought):\n"
+            "   You MUST begin your response with a <think>...</think> block containing your step-by-step narrative plan:\n"
+            "   - Scene-by-scene pacing: Plan word distribution to strictly match each scene's target words.\n"
+            "   - Narrative transition: Hook directly into the preceding scene continuation without verbatim sentence repetition.\n"
+            "   - Tone & Sensory palette: Outline sensory imagery and avoid literal phrasing from the context summary.\n"
+            "2. Chapter Prose:\n"
+            "   Immediately after </think>, output ONLY the final narrative prose.\n"
+            "   - Seamlessly flow between scenes according to the budgets.\n"
+            "   - DO NOT include scene labels, section titles, author notes, or meta-commentary outside <think>.\n"
+            "Begin with <think> now:\n"
+            if enable_cot
+            else "CRITICAL WRITING INSTRUCTIONS:\n"
+            "Output ONLY the final narrative prose seamlessly executing every scene goal and target word budget.\n"
+            "DO NOT include scene labels, section titles, or meta-commentary.\n"
+        )
+
+        return f"""You are an elite literary novelist. Write the complete narrative prose for {chapter_plan.get('chapter_title', 'Chapter')}.{arc_line}
 Total Target Length: Approximately {target_words} words.
 
 [CONTEXT SUMMARY]:
 {context_summary.get('plot_summary', '')}
 Active Characters: {', '.join(active_chars)}
-{tail_ref}
+{tail_ref}{conflict_directive}
 [CHAPTER GOAL]:
 {chapter_plan.get('chapter_goal', '')}
 
 [SCENE BREAKDOWN & WORD BUDGETS]:
 - {outline_str}
 
-CRITICAL WRITING INSTRUCTIONS:
-1. Test-Time Reasoning (Chain-of-Thought):
-   You MUST begin your response with a <think>...</think> block containing your step-by-step narrative plan:
-   - Scene-by-scene pacing: Plan word distribution to strictly match each scene's target words.
-   - Narrative transition: Hook directly into the preceding scene continuation without verbatim sentence repetition.
-   - Tone & Sensory palette: Outline sensory imagery and avoid literal phrasing from the context summary.
-2. Chapter Prose:
-   Immediately after </think>, output ONLY the final narrative prose.
-   - Seamlessly flow between scenes according to the budgets.
-   - DO NOT include scene labels, section titles, author notes, or meta-commentary outside <think>.
-Begin with <think> now:
-"""
+{cot_instructions}"""
 
     def _mock_prose(self, chapter_plan: Dict[str, Any], context_summary: Dict[str, Any]) -> str:
         ch_title = chapter_plan.get("chapter_title", "Chapter")
@@ -186,6 +263,7 @@ Begin with <think> now:
         active_chars = chapter_plan.get("characters_active", ["Protagonist"])
         target = chapter_plan.get("target_words", 1200)
         scenes = chapter_plan.get("scenes", [])
+        injected = chapter_plan.get("injected_contradiction", "")
 
         scene_plans = [
             f"- Scene {s.get('scene_index', i+1)} (~{s.get('target_words', 400)} words): Focus on {s.get('beat_goal', 'advancing plot')}."
@@ -201,31 +279,38 @@ Begin with <think> now:
             "</think>\n\n"
         )
 
+        injected_clause = f" {injected[:120]}." if injected else ""
         paragraphs = [
             f"{ch_title.upper()}\n\n"
-            f"The morning light pierced the dense gloom, casting long, fractured shadows across the stone floor. "
-            f"Elena stepped forward, her heart pounding with a steady, fierce rhythm. "
-            f"{ch_goal} Every step carried the weight of what had already transpired: {plot_sum[:120]}...",
-            f"\"We cannot afford to falter now,\" she murmured, turning to face the lingering silence. "
-            f"The air smelled of ozone, rust, and old parchment. The active figures—{', '.join(active_chars)}—stood at the precipice of a momentous discovery. "
-            f"Every thread of intention wound tightly around the central mystery, pulling them deeper into the labyrinth.",
-            f"Outside, the wind howled like an omen. The trials they faced were not merely physical; they probed the very boundaries of loyalty and purpose. "
-            f"With resolute clarity, the decision was made, cementing the transition into the next perilous chapter of their journey.",
+            f"The morning light pierced the dense gloom, casting long, fractured shadows across the threshold. "
+            f"{active_chars[0] if active_chars else 'Elena'} stepped forward calmly, determined to execute the goal: {ch_goal}.{injected_clause} "
+            f"Prior context weighed heavily: {plot_sum[:110]}...",
+            f"\"We cannot afford to falter now,\" a quiet voice echoed through the silence. "
+            f"The figures involved—{', '.join(active_chars)}—faced shifting complications while pursuing the exit objective: "
+            f"{chapter_plan.get('exit_state', 'tension builds further')}.",
         ]
+
+        # Add distinct prose per scene to accurately simulate Plan Adherence & Lexical Diversity in offline mock runs
+        for s in scenes:
+            beat_txt = s.get("beat_goal", "")
+            if beat_txt:
+                paragraphs.append(f"During this unfolding moment, the focus shifted decisively: {beat_txt}.")
 
         base_prose = "\n\n".join(paragraphs)
         current_words = count_words(base_prose)
 
         filler_sentences = [
-            "Shadows lengthened as the silence stretched between them, heavy with unspoken truths.",
-            "Across the horizon, the tempest gathered strength, painting the sky in violent hues of violet and charcoal.",
-            "Memory was an unreliable compass in a territory governed by shifting loyalties.",
-            "The ancient machinery hummed beneath their feet, vibrating with dormant energy awaiting ignition.",
-            "She checked the perimeter once more, knowing that time was slipping through their fingers like dry sand.",
+            "Shadows lengthened as the quiet stillness stretched across every arched corridor around them.",
+            "Across the distant ridge, a storm front gathered weight, staining the horizon with violet haze.",
+            "Uncertain memories surfaced unexpectedly beneath the weight of unspoken vows and old suspicions.",
+            "Ancient stone walls hummed faintly with a low vibration that echoed every measured footstep.",
+            "Time slipped steadily past as watchful eyes scanned the shifting perimeter for movement.",
+            "Cold air carried the scent of wet iron, cedar smoke, and distant rain.",
+            "Every small gesture revealed unspoken calculations hidden behind composed expressions.",
         ]
 
         extra_text = []
-        idx = 0
+        idx = chapter_plan.get("chapter_index", 1) * 3
         while current_words < target:
             sentence = filler_sentences[idx % len(filler_sentences)]
             extra_text.append(sentence)
@@ -241,6 +326,8 @@ Begin with <think> now:
 class MAGRPOPipeline:
     """
     Complete Two-Stage Local-to-Global Generation Pipeline for MA-GRPO.
+    Coordinates Stage-1 Macro Planning (OutlineAgent + PlanningAgent),
+    Stage-2 Two-Tier Memory Compression (CoordinatorAgent), and Writing Policy generation.
     """
 
     def __init__(
@@ -249,11 +336,65 @@ class MAGRPOPipeline:
         planning_agent: Optional[PlanningAgent] = None,
         coordinator_agent: Optional[CoordinatorAgent] = None,
         writing_policy: Optional[VLLMWritingPolicy] = None,
+        planner_llm_fn: Optional[Callable[[str, str], str]] = None,
     ):
-        self.outline_agent = outline_agent or OutlineAgent()
-        self.planning_agent = planning_agent or PlanningAgent()
-        self.coordinator_agent = coordinator_agent or CoordinatorAgent()
+        self.planner_llm_fn = planner_llm_fn
+        self.outline_agent = outline_agent or OutlineAgent(llm_generate_fn=planner_llm_fn)
+        self.planning_agent = planning_agent or PlanningAgent(llm_generate_fn=planner_llm_fn)
+        self.coordinator_agent = coordinator_agent or CoordinatorAgent(llm_generate_fn=planner_llm_fn)
         self.writing_policy = writing_policy or VLLMWritingPolicy(use_mock=True)
+
+    def execute_chapter_loop(
+        self,
+        blueprint: Dict[str, Any],
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        enable_cot: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Execute rolling multi-chapter generation over a partitioned blueprint
+        using Stage-2 CoordinatorAgent and VLLMWritingPolicy.
+        """
+        t_gen0 = time.time()
+        generated_chapters: List[str] = []
+        past_plans: List[Dict[str, Any]] = []
+        context_summaries: List[Dict[str, Any]] = []
+
+        events = blueprint.get("event_graph", {}).get("events", [])
+        all_characters = list(dict.fromkeys(
+            ev.get("character", "Protagonist") for ev in events
+        )) or ["Protagonist"]
+
+        for ch_plan in blueprint["chapters"]:
+            ch_idx = ch_plan["chapter_index"]
+            context_summary = self.coordinator_agent.condense_context(
+                next_chapter_index=ch_idx,
+                past_chapters=generated_chapters,
+                past_plans=past_plans,
+                characters=all_characters,
+            )
+            context_summaries.append(context_summary)
+
+            chapter_prose = self.writing_policy.generate_chapter_prose(
+                chapter_plan=ch_plan,
+                context_summary=context_summary,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max(1600, int(ch_plan.get("target_words", 1200) * 1.45)),
+                enable_cot=enable_cot,
+            )
+            generated_chapters.append(chapter_prose)
+            past_plans.append(ch_plan)
+
+        divider = "\n\n" + ("=" * 80) + "\n\n"
+        full_text = divider.join(generated_chapters)
+        return {
+            "chapters": generated_chapters,
+            "full_text": full_text,
+            "actual_total_words": count_words(full_text),
+            "generation_latency_s": round(time.time() - t_gen0, 2),
+            "context_summaries": context_summaries,
+        }
 
     def generate_story(
         self,
@@ -261,9 +402,10 @@ class MAGRPOPipeline:
         genre: str = "Science Fiction",
         total_target_words: int = 12000,
         num_chapters: int = 10,
+        enable_micro_subevents: bool = True,
     ) -> Dict[str, Any]:
         """
-        Executes end-to-end multi-agent generation using vLLM on Server 40GB.
+        Executes end-to-end rolling multi-agent generation (backward-compatible default: E / configurable D).
         """
         start_time = time.time()
 
@@ -277,6 +419,7 @@ class MAGRPOPipeline:
             event_graph=event_graph,
             total_target_words=total_target_words,
             num_chapters=num_chapters,
+            enable_micro_subevents=enable_micro_subevents,
         )
 
         generated_chapters: List[str] = []
@@ -286,6 +429,7 @@ class MAGRPOPipeline:
         all_characters = list(dict.fromkeys(
             event.get("character", "Protagonist") for event in event_graph.get("events", [])
         )) or ["Protagonist"]
+
         for ch_idx in range(1, num_chapters + 1):
             context_summary = self.coordinator_agent.condense_context(
                 next_chapter_index=ch_idx,

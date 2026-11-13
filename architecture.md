@@ -53,15 +53,21 @@ flowchart TD
 ```text
 src/
 ├── __init__.py          # Export các Agent chính và Reward Engine
-├── planning.py          # Stage 1: Lập dàn ý Đồ thị sự kiện, phân rã nhịp truyện & chia chương
+├── planning/            # Stage 1: Package Lập dàn ý (mỗi Agent một module riêng)
+│   ├── story_arc.py     # Story Arc Alignment 5 giai đoạn & Event Graph parser
+│   ├── outline_agent.py # OutlineAgent
+│   ├── sub_event_agent.py # SubEventAgent & DAG sanitization
+│   ├── plan_critic.py   # PlanCriticAgent (5 cổng kiểm duyệt)
+│   └── planning_agent.py# PlanningAgent (chia chương & ngân sách từ)
 ├── coordinator.py       # Stage 2: Tóm tắt ngữ cảnh ReIO, Cổng thẩm định V_s & cơ chế Fallback
 ├── rewards.py           # Động cơ 3 hàm thưởng nội tại (Length, Coherence, Quality)
-└── pipeline.py          # Bộ điều phối End-to-End Orchestrator Pipeline & vLLM/Local Engine
+├── pipeline.py          # Bộ điều phối End-to-End Orchestrator Pipeline & vLLM/Local Engine
+└── dataset_generator.py # Sinh tập dữ liệu Pilot / GRPO Training
 ```
 
 ---
 
-### 2.1. Module `src/planning.py` (Macro Planning)
+### 2.1. Package `src/planning/` (Macro Planning)
 
 Module chịu trách nhiệm xây dựng cốt truyện toàn cục theo chuẩn lý thuyết kịch bản văn học (Narrative Theory) và phân bổ ngân sách từ vựng.
 
