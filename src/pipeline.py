@@ -69,6 +69,7 @@ class VLLMWritingPolicy:
         custom_generate_fn: Optional[Callable[[str, int, float, float], str]] = None,
     ):
         self.model_name = model_name
+        self.max_model_len = max_model_len
         self.use_mock = use_mock
         self.custom_generate_fn = custom_generate_fn
         self.llm = None
@@ -109,6 +110,18 @@ class VLLMWritingPolicy:
             pass
         return prompt
 
+    def _clamp_max_tokens(self, formatted_prompt: str, requested_max_tokens: int) -> int:
+        """Clamp max_tokens so prompt_tokens + max_tokens fits inside vLLM max_model_len."""
+        if self.llm is None:
+            return max(1, requested_max_tokens)
+        try:
+            tok = self.llm.get_tokenizer()
+            prompt_tokens = len(tok.encode(formatted_prompt, add_special_tokens=False))
+        except Exception:
+            prompt_tokens = max(1, int(len(formatted_prompt.split()) * 1.4))
+        available = max(1, self.max_model_len - prompt_tokens - 32)
+        return max(1, min(requested_max_tokens, available))
+
     def generate_raw(
         self,
         prompt: str,
@@ -125,10 +138,11 @@ class VLLMWritingPolicy:
         from vllm import SamplingParams
 
         formatted = self._format_vllm_prompt(prompt)
+        safe_max_tokens = self._clamp_max_tokens(formatted, max_tokens)
         sampling_params = SamplingParams(
             temperature=temperature,
             top_p=top_p,
-            max_tokens=max_tokens,
+            max_tokens=safe_max_tokens,
             presence_penalty=0.1,
         )
         outputs = self.llm.generate([formatted], sampling_params)
@@ -178,15 +192,15 @@ class VLLMWritingPolicy:
         else:
             from vllm import SamplingParams
 
+            formatted = self._format_vllm_prompt(prompt)
+            safe_max_tokens = self._clamp_max_tokens(formatted, max_tokens)
             sampling_params = SamplingParams(
                 n=group_size,
                 temperature=temperature,
                 top_p=top_p,
-                max_tokens=max_tokens,
+                max_tokens=safe_max_tokens,
                 presence_penalty=0.1,
             )
-
-            formatted = self._format_vllm_prompt(prompt)
             outputs = self.llm.generate([formatted], sampling_params)
             raw_outputs = [o.text.strip() for o in outputs[0].outputs]
 

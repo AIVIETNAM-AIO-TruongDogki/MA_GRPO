@@ -45,43 +45,77 @@ WORKSPACE_ROOT = PROJECT_ROOT.parent
 def strip_length_constraints_from_premise(premise: str) -> str:
     """
     Remove conflicting short word-count instructions (e.g. 'between 1300-1400 words',
-    'at least 900 words') from benchmark prompts like TELL ME A STORY while
-    preserving POV, characters, setting, and plot directives for 8k-12k experiments.
+    'Make sure the word count is between 1,000 and 1,100.', 'Write a 700 word short story')
+    from benchmark prompts like TELL ME A STORY while preserving POV, characters,
+    setting, and plot directives for 8k-12k experiments.
     """
     if not premise:
         return ""
     text = premise.replace("\u00a0", " ").strip()
+    num_range = r"[\d,]+(?:\s*(?:and|to|–|-)\s*[\d,]+)?"
 
-    # Case 1: "Write between X-Y words telling a story about ..." -> "Write a story about ..."
+    # 1. Standalone full sentences solely specifying word count / length
     text = re.sub(
-        r"\bWrite\s+between\s+[\d,]+\s*(?:and|to|–|-)\s*[\d,]+\s*words\s+telling\s+a\s+story\b",
+        r"(?:^|\s)(?:Make sure |Ensure |Keep )?(?:the )?(?:story(?:'s)? )?(?:word\s+count|story\s+length|length)\s+(?:is|should\s+be|must\s+be)?\s*(?:at\s+least|around|about|over|under|less\s+than|more\s+than|roughly|between)?[^.]*?[\d,]+[^.]*?\.",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        rf"(?:^|\s)(?:(?:The|This)\s+)?story(?:\s+length)?\s+(?:should|must)\s+(?:be\s+)?(?:(?:at\s+least|around|about|over|under|less\s+than|more\s+than|roughly|approximately|between)\s+)?{num_range}\s*words?(?:\s+(?:long|in\s+length))?\.",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?:^|\s)(?:(?:The|This)\s+)?story\s+(?:should|must)\s+be\s+(?:at\s+least|around|about|over|between)[^.]*?\bwords?(?:\s+(?:long|in\s+length))?\.",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 2. Opening phrases:
+    # - "Write between X-Y words telling a story ..." -> "Write a story ..."
+    text = re.sub(
+        rf"\bWrite\s+between\s+{num_range}\s*words\s+telling\s+a\s+story\b",
         "Write a story",
         text,
         flags=re.IGNORECASE,
     )
-    # Case 2: "... must be between X and Y words and written in ..." -> "... must be written in ..."
+    # - "Write (me) a (less than) 700 / 1500 - 1530 word (epistolary/short) story ..."
     text = re.sub(
-        r"\bbetween\s+[\d,]+\s*(?:and|to|–|-)\s*[\d,]+\s*words\s+and\s+",
+        rf"\bWrite\s+(me\s+)?an?\s+(?:(?:less|more)\s+than\s+|over\s+|under\s+|roughly\s+|around\s+|about\s+)?{num_range}[-\s]+words?\s+(?=(?:[a-z]+\s+){{0,2}}story\b)",
+        lambda m: f"Write {m.group(1) or ''}a ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\ba\s+(?=[aeiouAEIOU][a-z]+\s+(?:[a-z]+\s+)?story\b)", "an ", text)
+    # - "Write a story of/between X-Y words ..." or "Write a story, X to Y words, ..."
+    text = re.sub(
+        rf"\bWrite\s+(me\s+)?a\s+story(?:\s*,?\s*(?:of|between|around|about|approximately|roughly)?\s*{num_range}\s*words(?:\s+long)?\s*,?|\s+that\s+is\s+(?:roughly\s+|less\s+than\s+|more\s+than\s+|around\s+|about\s+|over\s+|at\s+least\s+)?{num_range}\s*words(?:\s+long)?\s*,?)",
+        lambda m: f"Write {m.group(1) or ''}a story",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 3. Embedded clauses inside mixed sentences:
+    # "... must be between X and Y words and written in ..." -> "... must be written in ..."
+    text = re.sub(
+        rf"\bbetween\s+{num_range}\s*words\s+and\s+",
         "",
         text,
         flags=re.IGNORECASE,
     )
-    # Case 3: Standalone full sentences solely specifying word length
     text = re.sub(
-        r"(?:^|\s)(?:The|This)\s+story\s+(?:should|must)\s+(?:be\s+)?(?:at\s+least|around|about|over|between)[^.]*?\bwords(?:\s+long)?\.",
+        rf",?\s*\b(?:around|about|approximately|roughly|at\s+least|less\s+than|over|between\s+[\d,]+\s*(?:and|to|–|-)|between)\s*{num_range}\s*words(?:\s+(?:long|in\s+length))?\s*,?",
         " ",
         text,
         flags=re.IGNORECASE,
     )
-    # Case 4: Inline clauses like ", around 1600 words," or "in ~1500 words"
-    text = re.sub(
-        r",?\s*\b(?:around|about|approximately|at least|between\s+[\d,]+\s*(?:and|to|–|-))\s*[\d,]+\s*words(?:\s+long)?\s*,?",
-        " ",
-        text,
-        flags=re.IGNORECASE,
-    )
+
     text = re.sub(r"\s{2,}", " ", text)
     text = re.sub(r"\s+([.,;:])", r"\1", text)
+    text = re.sub(r"\bstory,\s+(?:about|from)\b", lambda m: "story " + m.group(0).split()[-1], text, flags=re.IGNORECASE)
     return text.strip()
 
 
@@ -943,8 +977,35 @@ Severity rules:
 - Moderate (weight 2): Sudden location/weapon/ability shift without transition.
 - Minor (weight 1): Clothing, time-of-day, or small prop mismatch."""
 
-    def __init__(self, judge_fn: Optional[Callable[[str, str], str]] = None):
+    def __init__(self, judge_fn: Optional[Callable[[str, str], str]] = None, max_retries: int = 2):
         self.judge_fn = judge_fn
+        self.max_retries = max(1, max_retries)
+
+    @staticmethod
+    def _empty_scores() -> Dict[str, Any]:
+        return {
+            "S_coh": None,
+            "judge_plan_adherence": None,
+            "judge_completeness": None,
+            "judge_writing_quality": None,
+            "judge_global_consistency": None,
+            "C_weighted": None,
+            "N_fatal": None,
+            "N_moderate": None,
+            "N_minor": None,
+            "perturbation_behavior": None,
+        }
+
+    @staticmethod
+    def _parse_judge_json(raw: str) -> Dict[str, Any]:
+        cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", raw or "").strip()
+        start = cleaned.find("{")
+        if start == -1:
+            raise ValueError("No JSON object found in judge output.")
+        parsed, _ = json.JSONDecoder().raw_decode(cleaned[start:])
+        if not isinstance(parsed, dict):
+            raise ValueError("Judge output JSON root must be an object.")
+        return parsed
 
     def evaluate(
         self,
@@ -953,18 +1014,7 @@ Severity rules:
         story_text: str,
     ) -> Dict[str, Any]:
         if self.judge_fn is None:
-            return {
-                "S_coh": None,
-                "judge_plan_adherence": None,
-                "judge_completeness": None,
-                "judge_writing_quality": None,
-                "judge_global_consistency": None,
-                "C_weighted": None,
-                "N_fatal": None,
-                "N_moderate": None,
-                "N_minor": None,
-                "perturbation_behavior": None,
-            }
+            return self._empty_scores()
 
         # Sample head + middle + tail if text exceeds judge token comfort window while preserving arcs
         words = strip_think_tags(story_text).split()
@@ -982,23 +1032,40 @@ Severity rules:
         user_prompt = (
             f"[PREMISE]:\n{premise}\n\n"
             f"[ASSIGNED PLAN SUMMARY]:\n{plan_summary[:2500]}\n\n"
-            f"[GENERATED STORY EXCERPT ({len(words)} total words)]:\n{excerpt}"
+            f"[GENERATED STORY EXCERPT ({len(words)} total words)]:\n{excerpt}\n\n"
+            "Respond strictly with ONE valid JSON object matching the schema."
         )
-        raw = self.judge_fn(self.SYSTEM_PROMPT, user_prompt)
-        match = re.search(r"\{[\s\S]*\}", raw)
-        parsed = json.loads(match.group(0) if match else raw)
 
-        n_fatal = int(parsed.get("n_fatal_inconsistencies", 0))
-        n_mod = int(parsed.get("n_moderate_inconsistencies", 0))
-        n_min = int(parsed.get("n_minor_inconsistencies", 0))
+        parsed: Optional[Dict[str, Any]] = None
+        last_err: Optional[Exception] = None
+        for _ in range(self.max_retries):
+            try:
+                raw = self.judge_fn(self.SYSTEM_PROMPT, user_prompt)
+                parsed = self._parse_judge_json(raw)
+                break
+            except Exception as exc:
+                last_err = exc
+                parsed = None
+
+        if parsed is None:
+            print(f"[LLMJudge5DimEvaluator] Warning: failed parsing judge JSON ({last_err}). Skipping sample.")
+            return self._empty_scores()
+
+        def _clamp_score(key: str) -> float:
+            val = float(parsed.get(key, 0.0))
+            return round(max(1.0, min(5.0, val)), 2)
+
+        n_fatal = max(0, int(parsed.get("n_fatal_inconsistencies", 0)))
+        n_mod = max(0, int(parsed.get("n_moderate_inconsistencies", 0)))
+        n_min = max(0, int(parsed.get("n_minor_inconsistencies", 0)))
         c_weighted = 3 * n_fatal + 2 * n_mod + n_min
 
         return {
-            "S_coh": float(parsed.get("story_coherence", 0.0)),
-            "judge_plan_adherence": float(parsed.get("plan_adherence", 0.0)),
-            "judge_completeness": float(parsed.get("completeness", 0.0)),
-            "judge_writing_quality": float(parsed.get("writing_quality", 0.0)),
-            "judge_global_consistency": float(parsed.get("global_consistency", 0.0)),
+            "S_coh": _clamp_score("story_coherence"),
+            "judge_plan_adherence": _clamp_score("plan_adherence"),
+            "judge_completeness": _clamp_score("completeness"),
+            "judge_writing_quality": _clamp_score("writing_quality"),
+            "judge_global_consistency": _clamp_score("global_consistency"),
             "C_weighted": c_weighted,
             "N_fatal": n_fatal,
             "N_moderate": n_mod,

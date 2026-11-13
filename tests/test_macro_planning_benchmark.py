@@ -503,6 +503,73 @@ class TestPipelineEndToEndConditions(unittest.TestCase):
         self.assertEqual(nb_data.get("nbformat"), 4)
         self.assertGreaterEqual(len(nb_data.get("cells", [])), 8)
 
+    def test_vllm_clamp_max_tokens_respects_max_model_len(self):
+        from src.pipeline import VLLMWritingPolicy
+
+        class _StubTokenizer:
+            @staticmethod
+            def encode(text: str, add_special_tokens: bool = False):
+                return text.split()
+
+        class _StubLLM:
+            @staticmethod
+            def get_tokenizer():
+                return _StubTokenizer()
+
+        policy = VLLMWritingPolicy(max_model_len=8192, use_mock=True)
+        policy.llm = _StubLLM()
+        prompt_200 = " ".join(["word"] * 200)
+        clamped = policy._clamp_max_tokens(prompt_200, 8192)
+        self.assertEqual(clamped, 8192 - 200 - 32)
+        self.assertLessEqual(200 + clamped, 8192)
+
+    def test_local_judge_resolution_and_json_resilience(self):
+        from experiments.benchmark.evaluator import LLMJudge5DimEvaluator
+        from experiments.benchmark.runner import parse_args, resolve_judge_runtime
+
+        # Auto-select local_vllm with Qwen2.5-32B-Instruct-AWQ when OPENAI_API_KEY is absent
+        old_key = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            args = parse_args(["--backend", "vllm", "--enable-judge"])
+            jb, jm = resolve_judge_runtime(args)
+            self.assertEqual(jb, "local_vllm")
+            self.assertEqual(jm, "Qwen/Qwen2.5-32B-Instruct-AWQ")
+        finally:
+            if old_key is not None:
+                os.environ["OPENAI_API_KEY"] = old_key
+
+        # Tolerate markdown fences and recover cleanly from invalid JSON
+        fenced_judge = LLMJudge5DimEvaluator(
+            judge_fn=lambda _s, _u: "```json\n{\"story_coherence\": 4.5, \"plan_adherence\": 4, \"completeness\": 4, \"writing_quality\": 4, \"global_consistency\": 5, \"n_fatal_inconsistencies\": 0, \"n_moderate_inconsistencies\": 1, \"n_minor_inconsistencies\": 2, \"perturbation_behavior\": \"Clean\"}\n```"
+        )
+        res_ok = fenced_judge.evaluate("premise", "plan", "story text")
+        self.assertEqual(res_ok["S_coh"], 4.5)
+        self.assertEqual(res_ok["C_weighted"], 4)
+
+        broken_judge = LLMJudge5DimEvaluator(judge_fn=lambda _s, _u: "not valid json")
+        res_bad = broken_judge.evaluate("premise", "plan", "story text")
+        self.assertIsNone(res_bad["S_coh"])
+
+        # End-to-end mock run with judge enabled produces populated S_coh & C_weighted
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            run_benchmark_main([
+                "--mode", "track2",
+                "--backend", "mock",
+                "--track2-samples", "1",
+                "--conditions", "A", "D",
+                "--target-words", "1200",
+                "--num-chapters", "2",
+                "--enable-judge",
+                "--judge-backend", "mock",
+                "--output-dir", tmp_dir,
+            ])
+            with open(os.path.join(tmp_dir, "benchmark_summary.json"), encoding="utf-8") as f:
+                summary = json.load(f)
+            self.assertTrue(summary["config"]["judge_enabled"])
+            self.assertEqual(summary["config"]["judge_backend"], "mock")
+            self.assertIsNotNone(summary["track2_summary"]["D"]["S_coh"])
+            self.assertIsNotNone(summary["track2_summary"]["D"]["C_weighted"])
+
 
 if __name__ == "__main__":
     unittest.main()

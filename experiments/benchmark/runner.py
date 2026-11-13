@@ -49,6 +49,60 @@ from experiments.benchmark.evaluator import (
 )
 
 
+def _cleanup_cuda_engine() -> None:
+    """Release vLLM distributed state and empty PyTorch CUDA cache."""
+    try:
+        from vllm.distributed.parallel_state import (
+            destroy_distributed_environment,
+            destroy_model_parallel,
+        )
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _hf_chat_completion(
+    model: Any,
+    tokenizer: Any,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+) -> str:
+    """Shared HuggingFace Transformers chat generation helper for Planner/Writer/Judge."""
+    import torch
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+    prompt_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+    do_sample = temperature > 0.05
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            do_sample=do_sample,
+            temperature=temperature if do_sample else None,
+            top_p=top_p if do_sample else None,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    gen_tokens = out[0][inputs["input_ids"].shape[1] :]
+    return tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+
+
 # ---------------------------------------------------------------------------
 # Backend Builders (Mock / HuggingFace Transformers / vLLM)
 # ---------------------------------------------------------------------------
@@ -99,26 +153,9 @@ class LocalGenerationBackend:
             self._hf_model.eval()
 
             def _hf_chat(system_prompt: str, user_prompt: str, max_tokens: int, temp: float, top_p: float) -> str:
-                messages = []
-                if system_prompt:
-                    messages.append({"role": "system", "content": system_prompt})
-                messages.append({"role": "user", "content": user_prompt})
-                prompt_text = self._hf_tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+                return _hf_chat_completion(
+                    self._hf_model, self._hf_tokenizer, system_prompt, user_prompt, max_tokens, temp, top_p
                 )
-                inputs = self._hf_tokenizer(prompt_text, return_tensors="pt").to(self._hf_model.device)
-                do_sample = temp > 0.05
-                with torch.no_grad():
-                    out = self._hf_model.generate(
-                        **inputs,
-                        max_new_tokens=max_tokens,
-                        do_sample=do_sample,
-                        temperature=temp if do_sample else None,
-                        top_p=top_p if do_sample else None,
-                        pad_token_id=self._hf_tokenizer.eos_token_id,
-                    )
-                gen_tokens = out[0][inputs["input_ids"].shape[1] :]
-                return self._hf_tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
 
             self.planner_llm_fn = lambda sys_p, usr_p: _hf_chat(sys_p, usr_p, 1024, 0.4, 0.9)
             self.writing_policy = VLLMWritingPolicy(
@@ -151,7 +188,11 @@ class LocalGenerationBackend:
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-                params = SamplingParams(temperature=0.4, top_p=0.9, max_tokens=1024)
+                params = SamplingParams(
+                    temperature=0.4,
+                    top_p=0.9,
+                    max_tokens=self.writing_policy._clamp_max_tokens(prompt_text, 1024),
+                )
                 outputs = vllm_engine.generate([prompt_text], params)
                 return outputs[0].outputs[0].text.strip()
 
@@ -174,22 +215,144 @@ class LocalGenerationBackend:
             del self.writing_policy.llm
             self.writing_policy.llm = None
         self.planner_llm_fn = None
-        try:
-            from vllm.distributed.parallel_state import (
-                destroy_distributed_environment,
-                destroy_model_parallel,
+        _cleanup_cuda_engine()
+
+
+def resolve_judge_runtime(args: argparse.Namespace) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve effective (judge_backend, judge_model) from CLI args and environment."""
+    if not getattr(args, "enable_judge", False):
+        return None, None
+
+    requested = getattr(args, "judge_backend", "auto")
+    api_key = getattr(args, "judge_api_key", None) or os.environ.get("OPENAI_API_KEY", "").strip()
+    judge_model = getattr(args, "judge_model", "gpt-4o-mini")
+
+    if requested == "auto":
+        if api_key:
+            jb = "api"
+        elif args.backend == "mock":
+            jb = "mock"
+        else:
+            jb = f"local_{args.backend}"
+    else:
+        jb = requested
+
+    if jb in {"local_vllm", "local_hf", "mock"} and judge_model == "gpt-4o-mini":
+        judge_model = "Qwen/Qwen2.5-32B-Instruct-AWQ"
+    return jb, judge_model
+
+
+class LocalJudgeBackend:
+    """
+    Runs LLM-as-a-Judge locally on GPU (e.g. Qwen2.5-14B-Instruct or Qwen2.5-32B-Instruct-AWQ)
+    or via OpenAI API / mock without keeping generation or NLI models loaded simultaneously.
+    """
+
+    def __init__(
+        self,
+        judge_backend: str,
+        judge_model: str,
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+        dtype: str = "auto",
+        gpu_memory_utilization: float = 0.85,
+        max_model_len: int = 12288,
+    ):
+        self.judge_backend = judge_backend
+        self.judge_model = judge_model
+        self._vllm = None
+        self._hf_model = None
+        self._hf_tokenizer = None
+        self.judge_fn: Optional[Callable[[str, str], str]] = None
+
+        if judge_backend == "api":
+            self.judge_fn = build_openai_judge_fn(api_key, api_base, judge_model)
+            if self.judge_fn is None:
+                raise RuntimeError("Judge backend 'api' selected, but OPENAI_API_KEY / --judge-api-key is missing.")
+            return
+
+        if judge_backend == "mock":
+            self.judge_fn = lambda _sys, _usr: json.dumps({
+                "story_coherence": 4.2,
+                "plan_adherence": 4.4,
+                "completeness": 4.1,
+                "writing_quality": 4.0,
+                "global_consistency": 4.3,
+                "n_fatal_inconsistencies": 0,
+                "n_moderate_inconsistencies": 1,
+                "n_minor_inconsistencies": 1,
+                "perturbation_behavior": "Clean",
+                "rationale": "Mock offline judge response.",
+            })
+            return
+
+        if judge_backend == "local_vllm":
+            from vllm import LLM, SamplingParams
+
+            lower_m = judge_model.lower()
+            resolved_dtype = "float16" if ("awq" in lower_m or "gptq" in lower_m) else resolve_optimal_dtype(dtype)
+            print(f"[Judge vLLM] Loading local judge: {judge_model} ({resolved_dtype}, VRAM={gpu_memory_utilization})...")
+            self._vllm = LLM(
+                model=judge_model,
+                dtype=resolved_dtype,
+                gpu_memory_utilization=gpu_memory_utilization,
+                max_model_len=max_model_len,
+                trust_remote_code=True,
             )
-            destroy_model_parallel()
-            destroy_distributed_environment()
-        except Exception:
-            pass
-        gc.collect()
-        try:
+            tok = self._vllm.get_tokenizer()
+
+            def _vllm_judge(sys_p: str, usr_p: str) -> str:
+                prompt_text = tok.apply_chat_template(
+                    [{"role": "system", "content": sys_p}, {"role": "user", "content": usr_p}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                prompt_tokens = len(tok.encode(prompt_text, add_special_tokens=False))
+                safe_max = max(64, min(768, max_model_len - prompt_tokens - 32))
+                params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=safe_max)
+                outputs = self._vllm.generate([prompt_text], params)
+                return outputs[0].outputs[0].text.strip()
+
+            self.judge_fn = _vllm_judge
+            return
+
+        if judge_backend == "local_hf":
             import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            resolved_dtype = resolve_optimal_dtype(dtype)
+            torch_dtype = torch.bfloat16 if resolved_dtype == "bfloat16" else torch.float16
+            print(f"[Judge HF] Loading local judge: {judge_model} ({resolved_dtype})...")
+            self._hf_tokenizer = AutoTokenizer.from_pretrained(judge_model, trust_remote_code=True)
+            self._hf_model = AutoModelForCausalLM.from_pretrained(
+                judge_model,
+                torch_dtype=torch_dtype,
+                device_map="auto",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+            )
+            self._hf_model.eval()
+            self.judge_fn = lambda sys_p, usr_p: _hf_chat_completion(
+                self._hf_model, self._hf_tokenizer, sys_p, usr_p, 768, 0.0, 1.0
+            )
+            return
+
+        raise ValueError(f"Unsupported judge_backend: {judge_backend}")
+
+    def release(self) -> None:
+        if self.judge_backend in {"api", "mock"}:
+            return
+        if self._hf_model is not None:
+            del self._hf_model
+            self._hf_model = None
+        if self._hf_tokenizer is not None:
+            del self._hf_tokenizer
+            self._hf_tokenizer = None
+        if self._vllm is not None:
+            del self._vllm
+            self._vllm = None
+        self.judge_fn = None
+        _cleanup_cuda_engine()
 
 
 def build_openai_judge_fn(
@@ -464,10 +627,21 @@ def run_phase1_generation(
 # ---------------------------------------------------------------------------
 # Phase 2: Scoring (VR-CLI Perplexity + DeBERTa NLI + Group A/B + Judge)
 # ---------------------------------------------------------------------------
+def _build_plan_summary(blueprint: Dict[str, Any]) -> str:
+    """Build concise plan summary text passed to LLM-as-a-Judge."""
+    parts = [
+        f"Ch {c.get('chapter_index', i+1)}: {c.get('chapter_goal', '')}"
+        for i, c in enumerate(blueprint.get("chapters", []))
+    ]
+    if blueprint.get("unstructured_plan"):
+        parts.insert(0, blueprint["unstructured_plan"])
+    return "\n".join(parts) or "No plan (Condition A direct)."
+
+
 def _evaluate_track2_record(
     rec: Dict[str, Any],
     nli_scorer: NLIScorer,
-    judge: LLMJudge5DimEvaluator,
+    judge: Optional[LLMJudge5DimEvaluator] = None,
 ) -> Dict[str, Any]:
     out = rec["pipeline_output"]
     premise = rec["premise"]
@@ -480,15 +654,11 @@ def _evaluate_track2_record(
     len_m = evaluate_length_and_termination(full_text, target_words)
     adh_m = evaluate_plan_adherence_doc_nli(chapters, blueprint, nli_scorer=nli_scorer, premise=premise)
     lex_m = evaluate_lexical_and_burstiness(full_text)
-
-    plan_summary_parts = [
-        f"Ch {c.get('chapter_index', i+1)}: {c.get('chapter_goal', '')}"
-        for i, c in enumerate(blueprint.get("chapters", []))
-    ]
-    if blueprint.get("unstructured_plan"):
-        plan_summary_parts.insert(0, blueprint["unstructured_plan"])
-    plan_summary = "\n".join(plan_summary_parts) or "No plan (Condition A direct)."
-    judge_m = judge.evaluate(premise=premise, plan_summary=plan_summary, story_text=full_text)
+    judge_m = (
+        judge.evaluate(premise=premise, plan_summary=_build_plan_summary(blueprint), story_text=full_text)
+        if judge is not None
+        else LLMJudge5DimEvaluator._empty_scores()
+    )
 
     row: Dict[str, Any] = {
         "sample_id": rec["sample_id"],
@@ -504,6 +674,19 @@ def _evaluate_track2_record(
     return row
 
 
+def _score_record_with_judge(rec: Dict[str, Any], row: Dict[str, Any], judge: LLMJudge5DimEvaluator) -> None:
+    """Populate 5-dimension Judge rubric fields onto an already evaluated Track 2 / Perturb row."""
+    out = rec["pipeline_output"]
+    blueprint = out.get("blueprint", {})
+    row.update(
+        judge.evaluate(
+            premise=rec["premise"],
+            plan_summary=_build_plan_summary(blueprint),
+            story_text=out.get("full_text", ""),
+        )
+    )
+
+
 def run_phase2_evaluation(
     args: argparse.Namespace,
     generated: Dict[str, Any],
@@ -511,19 +694,16 @@ def run_phase2_evaluation(
 ) -> Dict[str, Any]:
     use_mock_eval = args.backend == "mock"
     nli_scorer = NLIScorer(model_id=args.nli_model, use_mock=use_mock_eval)
-    judge_fn = (
-        build_openai_judge_fn(args.judge_api_key, args.judge_api_base, args.judge_model)
-        if args.enable_judge
-        else None
-    )
-    judge = LLMJudge5DimEvaluator(judge_fn=judge_fn)
+    judge_backend_name, judge_model_name = resolve_judge_runtime(args)
 
     summary_results: Dict[str, Any] = {
         "config": {
             "backend": args.backend,
             "model": args.model,
             "nli_model": args.nli_model,
-            "judge_enabled": judge_fn is not None,
+            "judge_enabled": judge_backend_name is not None,
+            "judge_backend": judge_backend_name,
+            "judge_model": judge_model_name,
             "target_words": args.target_words,
             "num_chapters": args.num_chapters,
         },
@@ -533,7 +713,7 @@ def run_phase2_evaluation(
         "hypotheses_audit": {},
     }
 
-    # --- Evaluate Track 1 (VR-CLI Perplexity + Group A) ---
+    # --- Phase 2a: Evaluate Track 1 (VR-CLI Perplexity + Group A) ---
     if generated.get("track1"):
         print(f"[Track 1 Phase 2] Evaluating {len(generated['track1'])} plans via VR-CLI + NLI...")
         vrcli = VRCLIPerplexityEvaluator(model_id=args.model, use_mock=use_mock_eval)
@@ -598,17 +778,70 @@ def run_phase2_evaluation(
             ["condition", "n_samples", "ppl_base", "ppl_planned", "I_pi", "S_cov", "S_prog", "S_causal", "S_arc", "planning_tokens", "planning_latency_s"],
         )
 
-    # --- Evaluate Track 2 (Group A + Group B + H1-H4 Audit) ---
+    # --- Phase 2b: Deterministic + NLI Evaluation for Track 2 & Perturbations ---
+    t2_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     t2_clean_by_sample: Dict[str, Dict[str, Any]] = {}
-    if generated.get("track2"):
-        print(f"[Track 2 Phase 2] Evaluating {len(generated['track2'])} stories (Group A & Group B)...")
-        t2_eval_rows: List[Dict[str, Any]] = []
-        for rec in generated["track2"]:
-            ev = _evaluate_track2_record(rec, nli_scorer, judge)
-            t2_eval_rows.append(ev)
-            if rec["condition"] == args.perturb_base_condition.upper():
-                t2_clean_by_sample[rec["sample_id"]] = ev
+    t2_clean_extra_recs: Dict[str, Dict[str, Any]] = {}
+    p_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
 
+    try:
+        if generated.get("track2"):
+            print(f"[Track 2 Phase 2] Evaluating {len(generated['track2'])} stories (Group A & NLI Group B)...")
+            for rec in generated["track2"]:
+                ev = _evaluate_track2_record(rec, nli_scorer, judge=None)
+                t2_pairs.append((rec, ev))
+                if rec["condition"] == args.perturb_base_condition.upper():
+                    t2_clean_by_sample[rec["sample_id"]] = ev
+
+        if generated.get("perturb"):
+            print(f"[Perturb Phase 2] Scoring {len(generated['perturb'])} perturbed runs with NLI...")
+            for rec in generated["perturb"]:
+                sid = rec["sample_id"]
+                if sid not in t2_clean_by_sample:
+                    clean_rec = rec["clean_reference"]
+                    t2_clean_by_sample[sid] = _evaluate_track2_record(clean_rec, nli_scorer, judge=None)
+                    t2_clean_extra_recs[sid] = clean_rec
+                pert_ev = _evaluate_track2_record(rec, nli_scorer, judge=None)
+                clean_bp = rec["clean_reference"]["pipeline_output"].get("blueprint", {})
+                pert_chapters = rec["pipeline_output"].get("chapters", [])
+                pert_ev["S_adh_on_perturbed"] = pert_ev.get("S_adh")
+                # Measure adherence of perturbed story against original CLEAN goals to detect plot divergence
+                pert_ev["S_adh"] = evaluate_plan_adherence_doc_nli(
+                    pert_chapters, clean_bp, nli_scorer=nli_scorer, premise=rec["premise"]
+                )["S_adh"]
+                p_pairs.append((rec, pert_ev))
+    finally:
+        # Unload NLI before loading a large local Judge LLM (14B / 32B-AWQ)
+        nli_scorer.unload()
+
+    # --- Phase 2c: Optional LLM-as-a-Judge Scoring (API or Local Qwen-14B / 32B-AWQ) ---
+    if judge_backend_name is not None and (t2_pairs or p_pairs):
+        print(f"[Judge Phase 2] Scoring {len(t2_pairs) + len(p_pairs)} stories via {judge_backend_name} ({judge_model_name})...")
+        judge_backend = LocalJudgeBackend(
+            judge_backend=judge_backend_name,
+            judge_model=judge_model_name or "Qwen/Qwen2.5-32B-Instruct-AWQ",
+            api_key=args.judge_api_key,
+            api_base=args.judge_api_base,
+            dtype=args.dtype,
+            gpu_memory_utilization=args.judge_gpu_memory_utilization,
+            max_model_len=args.judge_max_model_len,
+        )
+        try:
+            judge = LLMJudge5DimEvaluator(judge_fn=judge_backend.judge_fn)
+            for idx, (rec, ev) in enumerate(t2_pairs, 1):
+                print(f"  -> Judging Track 2 [{idx}/{len(t2_pairs)}] {rec['sample_id']} | Cond {rec['condition']}")
+                _score_record_with_judge(rec, ev, judge)
+            for sid, clean_rec in t2_clean_extra_recs.items():
+                _score_record_with_judge(clean_rec, t2_clean_by_sample[sid], judge)
+            for idx, (rec, pert_ev) in enumerate(p_pairs, 1):
+                print(f"  -> Judging Perturb [{idx}/{len(p_pairs)}] {rec['sample_id']} | {rec.get('perturbation_type')}")
+                _score_record_with_judge(rec, pert_ev, judge)
+        finally:
+            judge_backend.release()
+
+    # --- Phase 2d: Export Track 2, Perturb & Hypothesis Audit ---
+    if t2_pairs:
+        t2_eval_rows = [ev for _, ev in t2_pairs]
         write_jsonl_records(output_dir / "track2_raw.jsonl", t2_eval_rows)
         t2_summary_rows: List[Dict[str, Any]] = []
         for cond in [c for c in ["A", "B", "C", "D", "E"] if any(r["condition"] == c for r in t2_eval_rows)]:
@@ -656,25 +889,13 @@ def run_phase2_evaluation(
         )
         summary_results["hypotheses_audit"] = audit_hypotheses_h1_to_h4(summary_results["track2_summary"])
 
-    # --- Evaluate Perturbations (Delta Score) ---
-    if generated.get("perturb"):
-        print(f"[Perturb Phase 2] Scoring {len(generated['perturb'])} perturbed runs...")
+    if p_pairs:
         p_eval_rows: List[Dict[str, Any]] = []
-        for rec in generated["perturb"]:
+        for rec, pert_ev in p_pairs:
             sid = rec["sample_id"]
-            if sid not in t2_clean_by_sample:
-                t2_clean_by_sample[sid] = _evaluate_track2_record(rec["clean_reference"], nli_scorer, judge)
             clean_ev = t2_clean_by_sample[sid]
-            pert_ev = _evaluate_track2_record(rec, nli_scorer, judge)
-            clean_bp = rec["clean_reference"]["pipeline_output"].get("blueprint", {})
-            pert_chapters = rec["pipeline_output"].get("chapters", [])
-            pert_ev["S_adh_on_perturbed"] = pert_ev.get("S_adh")
-            # Measure adherence of the perturbed story against original CLEAN goals to detect plot divergence
-            pert_ev["S_adh"] = evaluate_plan_adherence_doc_nli(
-                pert_chapters, clean_bp, nli_scorer=nli_scorer, premise=rec["premise"]
-            )["S_adh"]
             delta = compute_perturbation_delta(clean_ev, pert_ev)
-            delta["S_adh_on_perturbed"] = pert_ev["S_adh_on_perturbed"]
+            delta["S_adh_on_perturbed"] = pert_ev.get("S_adh_on_perturbed")
             p_eval_rows.append({"sample_id": sid, "condition": rec["condition"], **delta})
 
         write_jsonl_records(output_dir / "perturb_raw.jsonl", p_eval_rows)
@@ -708,7 +929,6 @@ def run_phase2_evaluation(
             ],
         )
 
-    nli_scorer.unload()
     (output_dir / "benchmark_summary.json").write_text(
         json.dumps(summary_results, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -722,7 +942,8 @@ def write_markdown_report(path: Path, summary: Dict[str, Any]) -> None:
         "# Stage-1 Macro-Planning & Writing Utility Benchmark Report",
         "",
         f"- **Backend**: `{cfg['backend']}` | **Model**: `{cfg['model']}`",
-        f"- **NLI Scorer**: `{cfg['nli_model']}` | **Judge Enabled**: `{cfg['judge_enabled']}`",
+        f"- **NLI Scorer**: `{cfg['nli_model']}` | **Judge**: `{cfg['judge_enabled']}`"
+        + (f" (`{cfg.get('judge_backend')}` / `{cfg.get('judge_model')}`)" if cfg.get("judge_enabled") else ""),
         f"- **Track 2 Config**: Target `{cfg['target_words']}` words across `{cfg['num_chapters']}` chapters",
         "",
     ]
@@ -800,9 +1021,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--no-cot", action="store_true")
     parser.add_argument("--enable-judge", action="store_true")
+    parser.add_argument(
+        "--judge-backend",
+        choices=["auto", "api", "local_vllm", "local_hf", "mock"],
+        default="auto",
+    )
     parser.add_argument("--judge-api-key", default=None)
     parser.add_argument("--judge-api-base", default=None)
     parser.add_argument("--judge-model", default="gpt-4o-mini")
+    parser.add_argument("--judge-gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument("--judge-max-model-len", type=int, default=12288)
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "benchmark_outputs"))
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
