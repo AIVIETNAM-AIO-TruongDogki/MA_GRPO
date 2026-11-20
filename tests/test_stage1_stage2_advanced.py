@@ -286,6 +286,82 @@ class TestStage1AndStage2Advanced(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("submerged vault", ctx["plot_summary"])
 
+    def test_clean_tail_cumulative_ltm_none_twist_and_intra_para_dedup(self):
+        """Verify sentence-aligned tail, cumulative capped LTM in prompt, no 'Land turn: None', and intra-paragraph sentence dedup."""
+        from src.coordinator import compact_long_term_memory, extract_clean_tail
+        from src.pipeline import VLLMWritingPolicy, deduplicate_repeated_paragraphs
+
+        # 1. Clean tail removes dangling mid-sentence end and mid-sentence start
+        sentences = [
+            f"Sentence number {i} describes Mara exploring the flooded Venetian archive with her brass lantern."
+            for i in range(1, 22)
+        ]
+        dangling_prose = " ".join(sentences) + " As she reached for the door and"
+        tail = extract_clean_tail(dangling_prose, max_words=180)
+        self.assertTrue(tail.endswith("."), msg=f"Tail ended mid-sentence: {tail[-40:]}")
+        self.assertTrue(tail[0].isupper(), msg=f"Tail started mid-sentence: {tail[:40]}")
+        self.assertLessEqual(len(tail.split()), 180)
+
+        # 2. Cumulative LTM merges earlier milestones & enforces hard caps (<=8 events, <=6 chars, <=4 threads)
+        prev_ltm = {
+            "major_events": [f"Ch {i}: Milestone event {i} occurred." for i in range(1, 6)],
+            "character_states": {"Mara": "In Venice", "Lorenzo": "At workshop"},
+            "unresolved_plot_threads": ["Old mystery"],
+            "revealed_secrets": ["Grandfather built the clockwork"],
+        }
+        new_ltm = {
+            "major_events": ["Ch 6: Sabotage uncovered at the Arsenal."],
+            "character_states": {"Mara": "At Arsenal sluice", "Bellini": "Investigating"},
+            "unresolved_plot_threads": ["Stop the midnight flood"],
+            "revealed_secrets": ["Contarini rigged the gates"],
+        }
+        merged = compact_long_term_memory(new_ltm, previous_ltm=prev_ltm)
+        self.assertEqual(len(merged["major_events"]), 6)
+        self.assertIn("Ch 1: Milestone event 1 occurred.", merged["major_events"])
+        self.assertIn("Ch 6: Sabotage uncovered at the Arsenal.", merged["major_events"])
+        self.assertIn("Lorenzo", merged["character_states"])
+        self.assertEqual(merged["character_states"]["Mara"], "At Arsenal sluice")
+
+        # 3. VLLMWritingPolicy.construct_prompt includes [LONG-TERM STORY MEMORY] for Ch2+ only
+        policy = VLLMWritingPolicy(use_mock=True)
+        ch_plan = {"chapter_title": "Chapter 2", "chapter_goal": "Decode scroll", "target_words": 1000}
+        prompt_ch1 = policy.construct_prompt(ch_plan, {"completed_chapters": 0, "plot_summary": "Init", "long_term_memory": merged})
+        prompt_ch2 = policy.construct_prompt(ch_plan, {"completed_chapters": 1, "plot_summary": "Ch1 summary", "long_term_memory": merged})
+        self.assertNotIn("[LONG-TERM STORY MEMORY]:", prompt_ch1)
+        self.assertIn("[LONG-TERM STORY MEMORY]:", prompt_ch2)
+        self.assertIn("Ch 1: Milestone event 1 occurred.", prompt_ch2)
+
+        # 4. PlanningAgent Condition D never emits "Land turn: None"
+        eg = {
+            "premise": "Test",
+            "genre": "Fantasy",
+            "events": [
+                {
+                    "event_id": "E1",
+                    "title": "Quest Begins",
+                    "setting": "Meridia underwater kingdom",
+                    "character": "Arion",
+                    "action": "Arion investigates disappearances",
+                    "conflict": "Merfolk doubt his warnings",
+                    "plot_twist": "None",
+                    "depends_on": [],
+                }
+            ],
+        }
+        plan_d = self.planning_agent.partition_into_chapters(eg, total_target_words=1000, num_chapters=1, enable_micro_subevents=False)
+        scene_text = "\n".join(plan_d["chapters"][0]["scene_outline"])
+        self.assertNotIn("Land turn: None", scene_text)
+
+        # 5. Intra-paragraph repeated sentence loop (like Fantasy Ch4) is stripped
+        looped_para = (
+            "Arion's spear struck true and Lila's spells provided brief respite against the sea serpent's scales. "
+            "The storm above raged on with terrifying fury across the abyssal trench. "
+            "Arion's spear struck true and Lila's spells provided brief respite against the sea serpent's scales."
+        )
+        deduped, removed = deduplicate_repeated_paragraphs(looped_para)
+        self.assertGreaterEqual(removed, 1)
+        self.assertEqual(deduped.count("Arion's spear struck true"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

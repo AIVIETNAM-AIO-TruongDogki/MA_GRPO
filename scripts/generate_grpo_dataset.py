@@ -167,7 +167,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=12288)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--outline-max-tokens", type=int, default=2048)
-    parser.add_argument("--prose-max-tokens", type=int, default=900)
+    parser.add_argument("--prose-max-tokens", type=int, default=1100)
     parser.add_argument("--coordinator-max-tokens", type=int, default=768)
     parser.add_argument("--strict-mode", action="store_true", help="Quarantine outline parse failures instead of dynamic fallback.")
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "data" / "grpo_condition_d"))

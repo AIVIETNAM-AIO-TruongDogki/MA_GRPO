@@ -21,6 +21,8 @@ from .coordinator import (
     COORDINATOR_TWO_TIER_PROMPT,
     CoordinatorAgent,
     clean_json_response,
+    compact_long_term_memory,
+    extract_clean_tail,
 )
 from .pipeline import (
     VLLMWritingPolicy,
@@ -616,7 +618,7 @@ class ConditionDGRPODatasetGenerator:
         llm_generate_fn: Optional[Callable[[str, str], str]] = None,
         strict_mode: bool = False,
         outline_max_tokens: int = 2048,
-        prose_max_tokens: int = 900,
+        prose_max_tokens: int = 1100,
         coordinator_max_tokens: int = 768,
         outline_retries: int = 2,
     ):
@@ -752,16 +754,24 @@ class ConditionDGRPODatasetGenerator:
 
         for st in continuing_states:
             prev_text = st["past_chapters"][-1]
-            tail = " ".join(prev_text.strip().split()[-180:])
+            tail = extract_clean_tail(prev_text, max_words=180)
             recent_tails.append(tail)
             last_plan = st["past_plans"][-1]
+            prev_ctx = st.get("prev_context") or {}
+            prev_ltm = prev_ctx.get("long_term_memory")
+            prev_ltm_json = (
+                json.dumps(compact_long_term_memory(prev_ltm), ensure_ascii=False)
+                if isinstance(prev_ltm, dict) and int(prev_ctx.get("completed_chapters", 0) or 0) > 0
+                else "{}"
+            )
             user_prompt = (
                 f"Total chapters completed: {len(st['past_chapters'])}.\n"
                 f"Upcoming chapter index: {next_chapter_index}.\n\n"
-                f"[LAST CHAPTER PROSE (TAIL)]:\n{prev_text[-2500:]}\n\n"
+                f"[PREVIOUS LONG-TERM MEMORY (Preserve earlier milestones & update)]:\n{prev_ltm_json}\n\n"
+                f"[LAST CHAPTER PROSE (TAIL)]:\n{prev_text[-2800:]}\n\n"
                 f"[LAST CHAPTER PLAN GOAL]:\n{last_plan.get('chapter_goal', '')}\n"
                 f"[LAST CHAPTER EXIT STATE]:\n{last_plan.get('exit_state', '')}\n\n"
-                "Synthesize Two-Tier Context State matching the JSON schema.\n"
+                "Update and return the Two-Tier Context State matching the JSON schema.\n"
             )
             requests.append((COORDINATOR_TWO_TIER_PROMPT, user_prompt))
 
@@ -782,18 +792,26 @@ class ConditionDGRPODatasetGenerator:
             characters = (next_plan_preview or st["past_plans"][-1]).get("characters_active", ["Protagonist"])
 
             candidate_summary: Optional[Dict[str, Any]] = None
+            prev_ctx = st.get("prev_context") or {}
+            prev_ltm = (
+                prev_ctx.get("long_term_memory")
+                if int(prev_ctx.get("completed_chapters", 0) or 0) > 0
+                else None
+            )
             if raw_outputs is not None:
                 try:
                     data = json.loads(clean_json_response(raw_outputs[idx]))
-                    long_mem = data.get("long_term_memory", {})
+                    raw_long_mem = data.get("long_term_memory", {})
                     short_mem = data.get("short_term_memory", {})
-                    if not isinstance(long_mem, dict) or not isinstance(short_mem, dict):
+                    if not isinstance(raw_long_mem, dict) or not isinstance(short_mem, dict):
                         raise ValueError("Invalid two-tier memory JSON shape.")
+                    long_mem = compact_long_term_memory(raw_long_mem, previous_ltm=prev_ltm)
                     short_mem["recent_chapter_index"] = len(st["past_chapters"])
                     short_mem["recent_tail_excerpt"] = recent_tail
-                    plot_summary = str(short_mem.get("recent_chapter_summary", "")).strip()
+                    plot_summary = " ".join(str(short_mem.get("recent_chapter_summary", "")).strip().split()[:180])
                     if not plot_summary:
                         raise ValueError("Empty recent_chapter_summary.")
+                    short_mem["recent_chapter_summary"] = plot_summary
                     char_states_map = long_mem.get("character_states", {})
                     char_statuses = (
                         [f"{k}: {v}" for k, v in char_states_map.items()]

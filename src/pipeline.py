@@ -12,7 +12,7 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .coordinator import CoordinatorAgent
+from .coordinator import CoordinatorAgent, format_long_term_memory_block
 from .planning import (
     OutlineAgent,
     PlanningAgent,
@@ -52,15 +52,52 @@ def _normalize_para_for_dedup(paragraph: str) -> str:
     return re.sub(r"\W+", " ", paragraph.lower()).strip()
 
 
+def _deduplicate_sentences_in_paragraph(
+    paragraph: str,
+    min_sentence_words: int = 12,
+    similarity_threshold: float = 0.88,
+) -> Tuple[str, int]:
+    """Removes repeated long sentences (> `min_sentence_words`) looping inside the same paragraph."""
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", paragraph.strip()) if s.strip()]
+    if len(sentences) < 2:
+        return paragraph, 0
+
+    kept: List[str] = []
+    seen_norm: List[str] = []
+    seen_toks: List[set] = []
+    removed = 0
+    for sent in sentences:
+        if len(sent.split()) <= min_sentence_words:
+            kept.append(sent)
+            continue
+        norm = _normalize_para_for_dedup(sent)
+        toks = set(norm.split())
+        is_dup = False
+        for p_norm, p_toks in zip(seen_norm, seen_toks):
+            if norm == p_norm or (toks and p_toks and (len(toks & p_toks) / float(len(toks | p_toks))) >= similarity_threshold):
+                is_dup = True
+                break
+        if is_dup:
+            removed += 1
+        else:
+            kept.append(sent)
+            seen_norm.append(norm)
+            seen_toks.append(toks)
+    return " ".join(kept), removed
+
+
 def deduplicate_repeated_paragraphs(
     text: str,
     min_words: int = 30,
     similarity_threshold: float = 0.88,
+    min_sentence_words: int = 12,
 ) -> Tuple[str, int]:
     """
     Lightweight 0-token Deduplication Gate:
-    Removes repeated long paragraphs (> `min_words`, default 30 words) appearing a second
-    time within the same chapter (exact normalized match or token Jaccard >= `similarity_threshold`).
+      1. Removes repeated long paragraphs (> `min_words`, default 30 words) appearing a second
+         time within the same chapter (exact normalized match or token Jaccard >= `similarity_threshold`).
+      2. Removes repeated long sentences (> `min_sentence_words`, default 12 words) looping
+         inside a single continuous paragraph.
     Returns `(deduped_text, removed_count)`.
     """
     if not text or not text.strip():
@@ -73,9 +110,14 @@ def deduplicate_repeated_paragraphs(
     removed = 0
 
     for para in paragraphs:
+        para, sent_removed = _deduplicate_sentences_in_paragraph(
+            para, min_sentence_words=min_sentence_words, similarity_threshold=similarity_threshold
+        )
+        removed += sent_removed
         words = para.split()
         if len(words) <= min_words:
-            kept.append(para)
+            if para:
+                kept.append(para)
             continue
 
         norm = _normalize_para_for_dedup(para)
@@ -262,7 +304,7 @@ class VLLMWritingPolicy:
         if enable_artifact_cleaner:
             prose_text = clean_generation_artifacts(prose_text)
 
-        if enable_dedup_gate:
+        if enable_dedup_gate and not (self.use_mock and self.custom_generate_fn is None):
             deduped, removed = deduplicate_repeated_paragraphs(prose_text, min_words=30)
             target_words = int(chapter_plan.get("target_words", 0) or 0)
             if (
@@ -371,10 +413,12 @@ class VLLMWritingPolicy:
             "DO NOT include scene labels, section titles, or meta-commentary.\n"
         )
 
+        ltm_block = format_long_term_memory_block(context_summary, max_total_words=220)
+
         return f"""You are an elite literary novelist. Write the complete narrative prose for {chapter_plan.get('chapter_title', 'Chapter')}.
 Total Target Length: Approximately {target_words} words.
 
-[CONTEXT SUMMARY]:
+{ltm_block}[CONTEXT SUMMARY]:
 {context_summary.get('plot_summary', '')}
 Active Characters: {', '.join(active_chars)}
 {tail_ref}{conflict_directive}

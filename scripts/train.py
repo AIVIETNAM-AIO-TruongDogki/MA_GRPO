@@ -368,6 +368,7 @@ def main() -> None:
         "logging_steps": int(train_cfg.get("logging_steps", 2)),
         "save_steps": args.save_steps if args.save_steps is not None else int(train_cfg.get("save_steps", 10)),
         "num_generations": group_size,
+        "max_prompt_length": int(train_cfg.get("max_prompt_length", 1536)),
         "max_completion_length": max_tokens,
         "beta": float(train_cfg.get("kl_beta", 0.04)),
         "bf16": torch.cuda.is_bf16_supported(),

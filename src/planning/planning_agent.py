@@ -189,12 +189,23 @@ class PlanningAgent:
             s3 = max(1, target_words - s1 - s2)
             scene_budgets = [s1, s2, s3]
             parent_ev = event_lookup.get(first.get("event_id", ""), {})
+            ev_setting = str(parent_ev.get("setting") or "the scene setting").strip()
+            ev_action = str(parent_ev.get("action") or first.get("goal", "")).strip()
+            ev_conflict = str(parent_ev.get("conflict") or first.get("goal", "")).strip()
+            raw_twist = str(parent_ev.get("plot_twist") or last.get("exit_state") or "").strip()
+            if not raw_twist or raw_twist.lower() in {"none", "n/a", "null", "no twist", "none."}:
+                turn_goal = (
+                    "Escalate the immediate consequences of the chapter's conflict and close on a "
+                    "vivid transition hook leading naturally into the next chapter."
+                )
+            else:
+                turn_goal = f"Land turn: {raw_twist}"
             scenes = [
                 {
                     "scene_index": 1,
                     "title": f"{first.get('title', 'Chapter')} — Macro Opening",
                     "target_words": s1,
-                    "beat_goal": f"Establish {parent_ev.get('setting', 'the setting')} and introduce {first.get('goal', '')}",
+                    "beat_goal": f"Setting: {ev_setting}. Opening action: {ev_action}",
                     "required_facts": first.get("required_facts", []),
                     "exit_state": "Transition into central tension.",
                 },
@@ -202,7 +213,7 @@ class PlanningAgent:
                     "scene_index": 2,
                     "title": f"{first.get('title', 'Chapter')} — Macro Escalation",
                     "target_words": s2,
-                    "beat_goal": f"Develop conflict: {parent_ev.get('conflict', first.get('goal', ''))}",
+                    "beat_goal": f"Develop conflict: {ev_conflict}",
                     "required_facts": first.get("required_facts", []),
                     "exit_state": "Reach turning point.",
                 },
@@ -210,9 +221,9 @@ class PlanningAgent:
                     "scene_index": 3,
                     "title": f"{first.get('title', 'Chapter')} — Macro Turn & Transition",
                     "target_words": s3,
-                    "beat_goal": f"Land turn: {last.get('exit_state', 'Resolve chapter beat')}",
+                    "beat_goal": turn_goal,
                     "required_facts": first.get("required_facts", []),
-                    "exit_state": last.get("exit_state", ""),
+                    "exit_state": turn_goal,
                 },
             ]
             scene_outline = [
