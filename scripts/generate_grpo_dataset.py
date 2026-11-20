@@ -169,12 +169,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outline-max-tokens", type=int, default=2048)
     parser.add_argument("--prose-max-tokens", type=int, default=900)
     parser.add_argument("--coordinator-max-tokens", type=int, default=768)
-    parser.add_argument(
-        "--validator-threshold",
-        type=float,
-        default=0.80,
-        help="ContextGateValidator V_s threshold (set 0.0 to bypass heuristic fallback gate).",
-    )
     parser.add_argument("--strict-mode", action="store_true", help="Quarantine outline parse failures instead of dynamic fallback.")
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "data" / "grpo_condition_d"))
     parser.add_argument("--output-filename", default="grpo_train_condition_d.jsonl")
@@ -215,7 +209,6 @@ def main() -> None:
         generator = ConditionDGRPODatasetGenerator(
             batch_generate_fn=batch_fn,
             strict_mode=args.strict_mode,
-            validator_threshold=args.validator_threshold,
             outline_max_tokens=args.outline_max_tokens,
             prose_max_tokens=args.prose_max_tokens,
             coordinator_max_tokens=args.coordinator_max_tokens,

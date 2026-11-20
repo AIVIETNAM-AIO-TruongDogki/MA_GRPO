@@ -21,21 +21,102 @@ from .planning import (
 from .rewards import count_words, strip_think_tags
 
 
+_ARTIFACT_TAG_RE = re.compile(
+    r"(?:<think>[\s\S]*?</think>|"
+    r"</?think>|"
+    r"</?assistant>|"
+    r"<\|im_start\|>(?:assistant|user|system)?|"
+    r"<\|im_end\|>|"
+    r"<\|endoftext\|>|"
+    r"\[/?INST\]|"
+    r"</?s>)",
+    flags=re.IGNORECASE,
+)
+
+
+def clean_generation_artifacts(text: str) -> str:
+    """
+    Lightweight 0-token Artifact Cleaner:
+    Strips stray chat/reasoning special tokens (`<think>`, `</think>`, `</assistant>`,
+    `<|im_start|>`, `<|im_end|>`, `[INST]`, `[/INST]`, `<s>`, `</s>`) and normalizes whitespace.
+    """
+    if not text:
+        return ""
+    cleaned = _ARTIFACT_TAG_RE.sub("", text)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _normalize_para_for_dedup(paragraph: str) -> str:
+    return re.sub(r"\W+", " ", paragraph.lower()).strip()
+
+
+def deduplicate_repeated_paragraphs(
+    text: str,
+    min_words: int = 30,
+    similarity_threshold: float = 0.88,
+) -> Tuple[str, int]:
+    """
+    Lightweight 0-token Deduplication Gate:
+    Removes repeated long paragraphs (> `min_words`, default 30 words) appearing a second
+    time within the same chapter (exact normalized match or token Jaccard >= `similarity_threshold`).
+    Returns `(deduped_text, removed_count)`.
+    """
+    if not text or not text.strip():
+        return "", 0
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text.strip()) if p.strip()]
+    kept: List[str] = []
+    seen_norm: List[str] = []
+    seen_token_sets: List[set] = []
+    removed = 0
+
+    for para in paragraphs:
+        words = para.split()
+        if len(words) <= min_words:
+            kept.append(para)
+            continue
+
+        norm = _normalize_para_for_dedup(para)
+        toks = set(norm.split())
+        is_dup = False
+        for prev_norm, prev_toks in zip(seen_norm, seen_token_sets):
+            if norm == prev_norm:
+                is_dup = True
+                break
+            if toks and prev_toks:
+                jaccard = len(toks & prev_toks) / float(len(toks | prev_toks))
+                if jaccard >= similarity_threshold:
+                    is_dup = True
+                    break
+
+        if is_dup:
+            removed += 1
+        else:
+            kept.append(para)
+            seen_norm.append(norm)
+            seen_token_sets.append(toks)
+
+    return "\n\n".join(kept), removed
+
+
 def extract_cot_and_prose(text: str) -> Tuple[str, str]:
     """
     Extracts the <think>...</think> Test-Time reasoning chain and the actual narrative prose.
+    Applies Artifact Cleaner to prose so no orphan tags leak into stored chapters.
     Returns:
         (cot_text, prose_text)
     """
     if not text:
         return "", ""
-    think_match = re.search(r"<think>([\s\S]*?)</think>", text)
+    think_match = re.search(r"<think>([\s\S]*?)</think>", text, flags=re.IGNORECASE)
     cot_text = think_match.group(1).strip() if think_match else ""
-    if "</think>" in text:
-        prose_text = text.split("</think>", 1)[1].strip()
+    if re.search(r"</think>", text, flags=re.IGNORECASE):
+        prose_raw = re.split(r"</think>", text, maxsplit=1, flags=re.IGNORECASE)[1]
     else:
-        prose_text = re.sub(r"<think>[\s\S]*", "", text).strip() if "<think>" in text else text.strip()
-    return cot_text, prose_text
+        prose_raw = re.sub(r"<think>[\s\S]*", "", text, flags=re.IGNORECASE) if re.search(r"<think>", text, flags=re.IGNORECASE) else text
+    return cot_text, clean_generation_artifacts(prose_raw)
 
 
 def resolve_optimal_dtype(preferred: str = "auto") -> str:
@@ -156,9 +237,14 @@ class VLLMWritingPolicy:
         top_p: float = 0.95,
         max_tokens: int = 2200,
         enable_cot: bool = True,
+        enable_artifact_cleaner: bool = True,
+        enable_dedup_gate: bool = True,
+        dedup_retry_on_drop: bool = True,
     ) -> str:
         """
         Generates prose for a single structured chapter plan.
+        Applies lightweight 0-token Artifact Cleaner and Paragraph Deduplication Gate
+        (with optional higher-temperature retry when heavy duplication truncates the chapter).
         Returns strictly clean narrative prose (post-</think>).
         """
         prompt = self.construct_prompt(chapter_plan, context_summary, enable_cot=enable_cot)
@@ -170,7 +256,39 @@ class VLLMWritingPolicy:
             lambda: self._mock_prose(chapter_plan, context_summary),
         )
         _, prose_text = extract_cot_and_prose(raw_output)
-        return prose_text if prose_text else raw_output.strip()
+        prose_text = prose_text if prose_text else (
+            clean_generation_artifacts(raw_output) if enable_artifact_cleaner else raw_output.strip()
+        )
+        if enable_artifact_cleaner:
+            prose_text = clean_generation_artifacts(prose_text)
+
+        if enable_dedup_gate:
+            deduped, removed = deduplicate_repeated_paragraphs(prose_text, min_words=30)
+            target_words = int(chapter_plan.get("target_words", 0) or 0)
+            if (
+                removed > 0
+                and dedup_retry_on_drop
+                and not self.use_mock
+                and target_words > 0
+                and count_words(deduped) < int(0.75 * target_words)
+            ):
+                retry_temp = min(1.05, round(temperature + 0.12, 2))
+                raw_retry = self.generate_raw(
+                    prompt,
+                    max_tokens,
+                    retry_temp,
+                    top_p,
+                    lambda: self._mock_prose(chapter_plan, context_summary),
+                )
+                _, retry_prose = extract_cot_and_prose(raw_retry)
+                if enable_artifact_cleaner:
+                    retry_prose = clean_generation_artifacts(retry_prose or raw_retry)
+                retry_deduped, retry_removed = deduplicate_repeated_paragraphs(retry_prose, min_words=30)
+                if retry_removed < removed or count_words(retry_deduped) > count_words(deduped):
+                    deduped = retry_deduped
+            prose_text = deduped
+
+        return prose_text
 
     def generate_rollouts(
         self,

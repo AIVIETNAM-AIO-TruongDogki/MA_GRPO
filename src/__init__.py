@@ -4,13 +4,13 @@ Multi-Agent Group Relative Policy Optimization for Ultra-Long Narrative Generati
 
 Core Modules:
   - planning          : OutlineAgent (Event Graph + Story Arc), SubEventAgent, PlanCriticAgent, PlanningAgent
-  - coordinator       : CoordinatorAgent (Two-Tier Memory) & ContextGateValidator
+  - coordinator       : CoordinatorAgent (Two-Tier Memory)
   - rewards           : CompositeRewardEngine (Intrinsic GRPO Length, Coherence, Lexical Quality)
-  - pipeline          : VLLMWritingPolicy & MAGRPOPipeline
-  - dataset_generator : PilotDatasetGenerator & Canonical Premises
+  - pipeline          : VLLMWritingPolicy, Artifact Cleaner, Deduplication Gate & MAGRPOPipeline
+  - dataset_generator : PilotDatasetGenerator, ConditionDGRPODatasetGenerator & Canonical Premises
 """
 
-from .coordinator import ContextGateValidator, CoordinatorAgent
+from .coordinator import CoordinatorAgent
 from .dataset_generator import (
     CANONICAL_20_PREMISES,
     ConditionDGRPODatasetGenerator,
@@ -18,7 +18,14 @@ from .dataset_generator import (
     load_premises_pool,
     normalize_premise_text,
 )
-from .pipeline import MAGRPOPipeline, VLLMWritingPolicy, extract_cot_and_prose, resolve_optimal_dtype
+from .pipeline import (
+    MAGRPOPipeline,
+    VLLMWritingPolicy,
+    clean_generation_artifacts,
+    deduplicate_repeated_paragraphs,
+    extract_cot_and_prose,
+    resolve_optimal_dtype,
+)
 from .planning import (
     STORY_ARC_STAGES,
     OutlineAgent,
@@ -39,11 +46,12 @@ __all__ = [
     "PlanningAgent",
     "compute_story_arc_alignment",
     "CoordinatorAgent",
-    "ContextGateValidator",
     "CompositeRewardEngine",
     "calculate_length_reward",
     "VLLMWritingPolicy",
     "MAGRPOPipeline",
+    "clean_generation_artifacts",
+    "deduplicate_repeated_paragraphs",
     "extract_cot_and_prose",
     "resolve_optimal_dtype",
     "PilotDatasetGenerator",

@@ -3,7 +3,7 @@ Pilot Dataset Generator for MA-GRPO (MA-Plan-Pilot).
 
 Automates the production of 100-200 chapter-level prompts across 10-20 premises:
     - Stage 1: OutlineAgent -> SubEventAgent -> PlanningAgent -> PlanCriticAgent (5 criteria)
-    - Stage 2: CoordinatorAgent (Two-Tier Memory) -> ContextGateValidator (Multi-signal check)
+    - Stage 2: CoordinatorAgent (Two-Tier Memory)
     - Quarantine Queue: segregates invalid samples with diagnostic error logs.
     - Exports: pilot_dataset_chapters.jsonl and pilot_quality_report.json.
 """
@@ -19,11 +19,15 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from .coordinator import (
     COORDINATOR_TWO_TIER_PROMPT,
-    ContextGateValidator,
     CoordinatorAgent,
     clean_json_response,
 )
-from .pipeline import VLLMWritingPolicy, extract_cot_and_prose
+from .pipeline import (
+    VLLMWritingPolicy,
+    clean_generation_artifacts,
+    deduplicate_repeated_paragraphs,
+    extract_cot_and_prose,
+)
 from .planning import (
     EVENT_GENERATION_PROMPT,
     OutlineAgent,
@@ -192,7 +196,6 @@ class PilotDatasetGenerator:
         self,
         llm_generate_fn: Optional[Callable[[str, str], str]] = None,
         strict_mode: bool = False,
-        validator_threshold: float = 0.80,
     ):
         self.generate_fn = llm_generate_fn
         self.strict_mode = strict_mode
@@ -200,8 +203,7 @@ class PilotDatasetGenerator:
         self.sub_event_agent = SubEventAgent(llm_generate_fn=llm_generate_fn)
         self.critic = PlanCriticAgent()
         self.planning_agent = PlanningAgent(sub_event_agent=self.sub_event_agent, critic=self.critic)
-        self.validator = ContextGateValidator(llm_generate_fn=llm_generate_fn, threshold=validator_threshold)
-        self.coordinator = CoordinatorAgent(llm_generate_fn=llm_generate_fn, validator=self.validator)
+        self.coordinator = CoordinatorAgent(llm_generate_fn=llm_generate_fn)
 
     def generate_pilot_dataset(
         self,
@@ -304,7 +306,7 @@ class PilotDatasetGenerator:
                     })
                     break
 
-                # 4. Stage 2: Context Coordination & Validation
+                # 4. Stage 2: Context Coordination (Two-Tier Memory)
                 try:
                     context_state = self.coordinator.condense_context(
                         next_chapter_index=ch_idx,
@@ -314,23 +316,6 @@ class PilotDatasetGenerator:
                         previous_context=prev_context,
                         next_chapter_plan=chapter_plan,
                     )
-                    val_meta = context_state.get("validation_metadata", {})
-                    faithfulness_scores.append(val_meta.get("faithfulness_score", 1.0))
-                    completeness_scores.append(val_meta.get("completeness_score", 1.0))
-                    composite_scores.append(val_meta.get("composite_score", 1.0))
-
-                    if not val_meta.get("is_valid", False) and self.strict_mode:
-                        quarantine_samples.append({
-                            "premise_id": p_id,
-                            "chapter_index": ch_idx,
-                            "failure_stage": "Stage 2: ContextGateValidator",
-                            "error": f"V_s score {val_meta.get('composite_score')} < threshold",
-                            "validation_metadata": val_meta,
-                        })
-                        # Two-tier Coordinator automatically engages guaranteed structured fallback.
-                        # We record the event for auditing but do NOT abort subsequent chapters,
-                        # preserving narrative continuity across the full chapter sequence.
-
                 except Exception as e:
                     print(f"  [!] Coordinator Failure on Chapter {ch_idx} on {p_id}: {e}")
                     quarantine_samples.append({
@@ -358,7 +343,6 @@ class PilotDatasetGenerator:
                     "scene_outline": chapter_plan["scene_outline"],
                     "scenes": chapter_plan["scenes"],
                     "context_state": context_state,
-                    "validation_metadata": context_state.get("validation_metadata", {}),
                     "full_training_prompt": training_prompt,
                     "prompt": training_prompt,
                     "context_summary": short_mem.get("recent_chapter_summary", context_state.get("plot_summary", "")),
@@ -395,10 +379,6 @@ class PilotDatasetGenerator:
                 f.write(json.dumps(q, ensure_ascii=False) + "\n")
 
         # 7. Aggregate Research Quality Report
-        avg_faith = sum(faithfulness_scores) / len(faithfulness_scores) if faithfulness_scores else 0.0
-        avg_comp = sum(completeness_scores) / len(completeness_scores) if completeness_scores else 0.0
-        avg_composite = sum(composite_scores) / len(composite_scores) if composite_scores else 0.0
-
         report = {
             "total_premises_submitted": len(selected_premises),
             "valid_chapter_samples_generated": len(valid_samples),
@@ -407,9 +387,6 @@ class PilotDatasetGenerator:
             "total_sub_events_decomposed": total_sub_events_count,
             "dag_dependency_validation_rate": 100.0,
             "word_budget_exactness_rate": 100.0,
-            "mean_faithfulness_score": round(avg_faith, 4),
-            "mean_completeness_score": round(avg_comp, 4),
-            "mean_composite_vs_score": round(avg_composite, 4),
             "artifacts": {
                 "pilot_samples_file": str(valid_jsonl_path),
                 "quarantine_failures_file": str(quarantine_jsonl_path),
@@ -424,7 +401,6 @@ class PilotDatasetGenerator:
         print(f"PILOT GENERATION FINISHED!")
         print(f"Valid Samples Created: {len(valid_samples)} | Quarantined: {len(quarantine_samples)}")
         print(f"Success Rate: {report['success_rate_percent']}%")
-        print(f"Mean Faithfulness: {avg_faith:.4f} | Mean Completeness: {avg_comp:.4f} | V_s: {avg_composite:.4f}")
         print(f"Report saved to: {report_path.resolve()}")
         print(f"==========================================================================\n")
 
@@ -639,8 +615,6 @@ class ConditionDGRPODatasetGenerator:
         batch_generate_fn: Optional[Callable[[List[Tuple[str, str]], int, float], List[str]]] = None,
         llm_generate_fn: Optional[Callable[[str, str], str]] = None,
         strict_mode: bool = False,
-        validator_threshold: float = 0.80,
-        use_llm_validator: bool = False,
         outline_max_tokens: int = 2048,
         prose_max_tokens: int = 900,
         coordinator_max_tokens: int = 768,
@@ -662,11 +636,7 @@ class ConditionDGRPODatasetGenerator:
             critic=self.critic,
             enable_micro_subevents=False,
         )
-        self.validator = ContextGateValidator(
-            llm_generate_fn=llm_generate_fn if use_llm_validator else None,
-            threshold=validator_threshold,
-        )
-        self.coordinator = CoordinatorAgent(llm_generate_fn=llm_generate_fn, validator=self.validator)
+        self.coordinator = CoordinatorAgent(llm_generate_fn=llm_generate_fn)
         self.prompt_builder = VLLMWritingPolicy(use_mock=True)
 
     def _run_batch_llm(
@@ -855,33 +825,7 @@ class ConditionDGRPODatasetGenerator:
                     next_chapter_plan=next_plan_preview,
                 )
 
-            val_result = self.validator.validate_summary(
-                summary=candidate_summary,
-                prev_chapter_text=prev_text,
-                prev_chapter_plan=st["past_plans"][-1],
-                previous_context=st["prev_context"],
-                next_chapter_plan=next_plan_preview,
-            )
-
-            if val_result.get("is_valid", False):
-                candidate_summary["validation_metadata"] = dict(val_result)
-                candidate_summary["validation_metadata"]["is_fallback"] = False
-                candidate_summary["validation_metadata"]["fallback_reason"] = None
-                st["prev_context"] = candidate_summary
-            else:
-                fallback_summary = self.coordinator._structured_state_extraction(
-                    next_chapter_index=next_chapter_index,
-                    past_chapters=st["past_chapters"],
-                    past_plans=st["past_plans"],
-                    characters=characters,
-                    recent_tail=recent_tail,
-                    previous_context=st["prev_context"],
-                    next_chapter_plan=next_plan_preview,
-                )
-                fallback_summary["validation_metadata"] = dict(val_result)
-                fallback_summary["validation_metadata"]["is_fallback"] = True
-                fallback_summary["validation_metadata"]["fallback_reason"] = val_result.get("feedback")
-                st["prev_context"] = fallback_summary
+            st["prev_context"] = candidate_summary
 
     def generate_dataset(
         self,
@@ -901,11 +845,23 @@ class ConditionDGRPODatasetGenerator:
         out_path = Path(output_dir)
         out_path.mkdir(parents=True, exist_ok=True)
         jsonl_path = out_path / output_filename
+        macro_plans_path = out_path / f"{Path(output_filename).stem}_macro_plans.json"
         quarantine_path = out_path / "quarantine_failures.jsonl"
         report_path = out_path / "dataset_quality_report.json"
 
         existing_records: List[Dict[str, Any]] = []
         completed_premise_ids: Set[str] = set()
+        macro_plans_by_pid: Dict[str, Dict[str, Any]] = {}
+        if resume and macro_plans_path.exists():
+            try:
+                loaded_plans = json.loads(macro_plans_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_plans, list):
+                    for mp in loaded_plans:
+                        mp_pid = str(mp.get("premise_id") or (mp.get("item") or {}).get("id") or "")
+                        if mp_pid:
+                            macro_plans_by_pid[mp_pid] = mp
+            except Exception:
+                macro_plans_by_pid = {}
 
         if resume and jsonl_path.exists():
             by_pid: Dict[str, List[Dict[str, Any]]] = {}
@@ -942,6 +898,8 @@ class ConditionDGRPODatasetGenerator:
             existing_records = clean_records
         elif not resume and jsonl_path.exists():
             jsonl_path.unlink()
+            if macro_plans_path.exists():
+                macro_plans_path.unlink()
 
         todo_premises = [p for p in premises if str(p["id"]) not in completed_premise_ids]
         batch_size = max(1, int(batch_size))
@@ -1076,7 +1034,6 @@ class ConditionDGRPODatasetGenerator:
                         "characters_active": chapter_plan.get("characters_active", ["Protagonist"]),
                         "scene_outline": chapter_plan.get("scene_outline", []),
                         "context_state": ctx_state,
-                        "validation_metadata": ctx_state.get("validation_metadata", {}),
                         "planning_tokens": st["event_graph"].get("planning_tokens"),
                         "prompt": training_prompt,
                         "full_training_prompt": training_prompt,
@@ -1111,7 +1068,8 @@ class ConditionDGRPODatasetGenerator:
                         ch_plan = st["current_chapter_plan"]
                         if raw_proses is not None:
                             _, clean_prose = extract_cot_and_prose(raw_proses[idx])
-                            prose_text = clean_prose if clean_prose else raw_proses[idx].strip()
+                            prose_text = clean_prose if clean_prose else clean_generation_artifacts(raw_proses[idx])
+                            prose_text, _ = deduplicate_repeated_paragraphs(prose_text, min_words=30)
                         else:
                             raw_mock = self.prompt_builder._mock_prose(ch_plan, st["prev_context"])
                             _, prose_text = extract_cot_and_prose(raw_mock)
@@ -1126,11 +1084,22 @@ class ConditionDGRPODatasetGenerator:
             for st in active_states:
                 if not st["failed"] and len(st["records"]) == st["num_chapters"]:
                     batch_records.extend(st["records"])
+                    mp_pid = str(st["item"]["id"])
+                    macro_plans_by_pid[mp_pid] = {
+                        "premise_id": mp_pid,
+                        "item": st["item"],
+                        "event_graph": st["event_graph"],
+                        "story_plan": st["story_plan"],
+                    }
 
             if batch_records:
                 with open(jsonl_path, "a", encoding="utf-8") as f:
                     for rec in batch_records:
                         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                macro_plans_path.write_text(
+                    json.dumps(list(macro_plans_by_pid.values()), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
                 existing_records.extend(batch_records)
                 new_records_count += len(batch_records)
 
@@ -1166,6 +1135,7 @@ class ConditionDGRPODatasetGenerator:
             "enable_micro_subevents": False,
             "freytag_enforced": False,
             "output_file": str(jsonl_path.resolve()),
+            "macro_plans_file": str(macro_plans_path.resolve()),
             "total_premises_requested": len(premises),
             "completed_premises": len(unique_pids),
             "valid_chapter_samples": len(existing_records),

@@ -3,7 +3,7 @@ Unit Tests for MA-GRPO Phase 2 (StoryWriter Event Graph Integration).
 Verifies:
     1. StoryWriter event regex parser (Setting, Character, Action, Conflict, Plot Twist)
     2. Event Graph construction & K-Chapter partitioning
-    3. Coordinator ReIO context condensation & Context Gate Validator (V_s)
+    3. Coordinator ReIO context condensation
     4. End-to-End story generation simulation
 """
 
@@ -14,7 +14,7 @@ from pathlib import Path
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.coordinator import ContextGateValidator, CoordinatorAgent
+from src.coordinator import CoordinatorAgent
 from src.pipeline import VLLMWritingPolicy, MAGRPOPipeline
 from src.planning import OutlineAgent, PlanningAgent, parse_storywriter_events
 from src.rewards import count_words
@@ -98,25 +98,6 @@ Plot Twist: Sonya's distress transponder is receiving replies from inside the gl
         self.assertEqual(len(planned_ids), len(set(planned_ids)))
         self.assertEqual(set(planned_ids), set(story_plan["completed_sub_event_ids"]))
         self.assertEqual(story_plan["remaining_target_words"], 0)
-
-    def test_context_gate_validator(self):
-        validator = ContextGateValidator(threshold=0.80)
-        summary = {
-            "chapter_index": 2,
-            "completed_chapters": 1,
-            "plot_summary": "The explorer discovered the crystalline cavern and activated the relay.",
-            "character_statuses": ["Elena: Weary"],
-            "pending_threads": ["Decipher the signal"],
-            "recent_tail_excerpt": "The light dimmed slowly.",
-        }
-        prev_text = "The explorer ventured into the crystalline cavern and initiated the primary relay."
-
-        result = validator.validate_summary(summary, prev_text)
-        self.assertIsInstance(result, dict)
-        self.assertIn("composite_score", result)
-        self.assertIn("is_valid", result)
-        self.assertGreaterEqual(result["composite_score"], 0.0)
-        self.assertLessEqual(result["composite_score"], 1.0)
 
     def test_coordinator_reio_continuity(self):
         ch1_text = "The launch sequence initiated. Elena secured her harness as the engines roared."

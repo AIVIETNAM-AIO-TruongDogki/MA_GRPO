@@ -10,8 +10,7 @@ Verifies:
        - Word budget matching (sum(scene_budgets) == target_words)
        - Event ordering (monotonic chronological progression)
     4. Two-Tier Memory in CoordinatorAgent (long_term_memory + short_term_memory).
-    5. ContextGateValidator multi-signal verification (negation contradiction check, 5-part input).
-    6. Non-generic structured state fallback and validation metadata preservation.
+    5. 0-token Artifact Cleaner & Paragraph Deduplication Gate in VLLMWritingPolicy.
 """
 
 import sys
@@ -21,7 +20,7 @@ from pathlib import Path
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.coordinator import ContextGateValidator, CoordinatorAgent, detect_heuristic_negation_contradictions
+from src.coordinator import CoordinatorAgent
 from src.planning import (
     OutlineAgent,
     PlanningAgent,
@@ -40,7 +39,6 @@ class TestStage1AndStage2Advanced(unittest.TestCase):
         self.critic = PlanCriticAgent()
         self.planning_agent = PlanningAgent()
         self.coordinator = CoordinatorAgent()
-        self.validator = ContextGateValidator()
 
     def test_outline_agent_strict_mode_rejects_without_llm(self):
         """In strict dataset mode, OutlineAgent must raise ValueError rather than using a static template."""
@@ -178,37 +176,6 @@ class TestStage1AndStage2Advanced(unittest.TestCase):
         # Top-level compatibility fields exist
         self.assertIn("plot_summary", context)
         self.assertIn("recent_tail_excerpt", context)
-        self.assertIn("validation_metadata", context)
-        self.assertIn("faithfulness_score", context["validation_metadata"])
-        self.assertIn("is_valid", context["validation_metadata"])
-
-    def test_validator_negation_contradiction_detection(self):
-        """Detect negation contradiction clashes where summary inverts source polarity."""
-        source = "Elena trusted Marcus completely throughout the trial."
-        # Contradictory summary (Summary negates, Source affirms)
-        contradictory_summary = "Elena did not trust Marcus during the trial."
-        clashes = detect_heuristic_negation_contradictions(contradictory_summary, source)
-        self.assertTrue(len(clashes) > 0)
-
-        # Contradictory summary (Source negates, Summary affirms)
-        source_neg = "Elena did not trust Marcus during the trial."
-        summary_affirm = "Elena trusted Marcus as they faced the trial."
-        clashes_rev = detect_heuristic_negation_contradictions(summary_affirm, source_neg)
-        self.assertTrue(len(clashes_rev) > 0)
-
-        # Valid non-contradictory summary
-        valid_summary = "Elena trusted Marcus as they faced the trial."
-        clashes_valid = detect_heuristic_negation_contradictions(valid_summary, source)
-        self.assertEqual(len(clashes_valid), 0)
-
-        # Stopwords and unrelated clauses must NOT trigger false positives
-        p3_summary = "This revelation sets the stage for their upcoming journey and the challenges they must face."
-        p3_source = "The trial of Horus. Anubis revealed the deeper plan. The journey continued into the subsequent sector."
-        self.assertEqual(len(detect_heuristic_negation_contradictions(p3_summary, p3_source)), 0)
-
-        p4_summary = "Vasquez, realizing these are not random, deduces that an external force is controlling them."
-        p4_source = "Vasquez descended into the trench with her team. She realized that anomalous signals were transmitting."
-        self.assertEqual(len(detect_heuristic_negation_contradictions(p4_summary, p4_source)), 0)
 
     def test_pilot_dataset_generator_run(self):
         """Verify PilotDatasetGenerator runs end-to-end on premises and exports jsonl."""
@@ -236,6 +203,88 @@ class TestStage1AndStage2Advanced(unittest.TestCase):
             self.assertTrue(Path(report["artifacts"]["quarantine_failures_file"]).exists())
         finally:
             shutil.rmtree(temp_dir)
+
+    def test_artifact_cleaner_and_paragraph_deduplication_gate(self):
+        """Verify 0-token Artifact Cleaner and Paragraph Deduplication Gate (+ higher-temp retry)."""
+        from src.pipeline import (
+            VLLMWritingPolicy,
+            clean_generation_artifacts,
+            deduplicate_repeated_paragraphs,
+        )
+
+        dirty = (
+            "<think>Internal plan</think>\n"
+            "</think> [INST] Mara stepped into the storm. </assistant><|im_end|>\n\n\n"
+            "Lightning split the pier.</s>"
+        )
+        cleaned = clean_generation_artifacts(dirty)
+        for bad in ("<think>", "</think>", "</assistant>", "[INST]", "<|im_end|>", "</s>"):
+            self.assertNotIn(bad, cleaned)
+        self.assertIn("Mara stepped into the storm.", cleaned)
+        self.assertIn("Lightning split the pier.", cleaned)
+
+        long_para = (
+            "Mara carried the brass lantern down the flooded stone staircase while cold canal water "
+            "lapped against the iron bulkhead and distant bells echoed across the Venetian lagoon "
+            "beneath the heavy autumn storm clouds gathering overhead."
+        )
+        short_para = "She paused and listened closely."
+        text_with_dup = f"{long_para}\n\n{short_para}\n\n{long_para}\n\n{short_para}"
+        deduped, removed = deduplicate_repeated_paragraphs(text_with_dup, min_words=30)
+        self.assertEqual(removed, 1)
+        self.assertEqual(deduped.count("Mara carried the brass lantern"), 1)
+        # Short paragraphs (<= 30 words) are preserved
+        self.assertEqual(deduped.count(short_para), 2)
+
+        # Higher-temperature retry triggers when dedup drops length below 75% of target_words
+        recorded_temps = []
+        unique_para_2 = (
+            "Inside the dry restoration loft, Lorenzo unfolded the perforated copper scroll beneath "
+            "the magnifier glass and traced the hidden tidal sluice coordinates etched along the margin "
+            "before footsteps echoed sharply along the wooden landing outside."
+        )
+
+        def _fake_gen(_prompt, _max_tok, temp, _top_p):
+            recorded_temps.append(temp)
+            if len(recorded_temps) == 1:
+                return f"<think>draft</think>\n{long_para}\n\n{long_para} </assistant>"
+            return f"<think>retry</think>\n{long_para}\n\n{unique_para_2}"
+
+        policy = VLLMWritingPolicy(use_mock=False, custom_generate_fn=_fake_gen)
+        out = policy.generate_chapter_prose(
+            chapter_plan={"chapter_title": "Ch 1", "chapter_goal": "Unlock vault", "target_words": 60},
+            context_summary={"plot_summary": "Start"},
+            temperature=0.80,
+        )
+        self.assertEqual(len(recorded_temps), 2)
+        self.assertGreater(recorded_temps[1], recorded_temps[0])
+        self.assertIn("Lorenzo unfolded", out)
+        self.assertNotIn("</assistant>", out)
+
+    def test_coordinator_single_llm_call_no_validator(self):
+        """CoordinatorAgent synthesizes two-tier memory in 1 LLM call without any validator layer."""
+        calls = []
+
+        def _mock_coord_llm(sys_p, _usr_p):
+            calls.append(sys_p)
+            return (
+                '{"long_term_memory": {"major_events": ["Found vault"], '
+                '"character_states": {"Mara": "Alert"}, "unresolved_plot_threads": ["Cipher"], '
+                '"revealed_secrets": []}, "short_term_memory": {"recent_chapter_summary": '
+                '"Mara unlocked the submerged vault and escaped the rising tide.", '
+                '"immediate_turning_point": "Guards arrive at the canal."}}'
+            )
+
+        coord = CoordinatorAgent(llm_generate_fn=_mock_coord_llm)
+        ctx = coord.condense_context(
+            next_chapter_index=2,
+            past_chapters=["Chapter 1 prose about Mara in Venice."],
+            past_plans=[{"chapter_index": 1, "chapter_title": "Ch 1", "chapter_goal": "Find vault", "exit_state": "Escaped"}],
+            characters=["Mara"],
+        )
+        # Exactly 1 LLM call (Coordinator only, zero validator calls)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("submerged vault", ctx["plot_summary"])
 
 
 if __name__ == "__main__":

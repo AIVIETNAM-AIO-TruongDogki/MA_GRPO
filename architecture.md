@@ -20,16 +20,13 @@ flowchart TD
     subgraph STAGE2 ["STAGE 2: LOCAL WRITING & REINFORCEMENT LEARNING"]
         PlanningAgent --> ChapterBlueprint["Chapter Goal (E_i) & Target Words (L_target)"]
         History["Past Generated Text C_{1...i-1}"] --> Coordinator["CoordinatorAgent (ReIO)<br/>(Compress Context to s_i < 4096 tokens)"]
-        Coordinator --> Validator["ContextGateValidator (V_s)<br/>(Faithfulness & Completeness Check)"]
+        Coordinator --> ContextState["Two-Tier Context State (s_i)"]
         
-        Validator -- "V_s >= 0.8" --> ValidatedContext["Validated Context State (s_i)"]
-        Validator -- "V_s < 0.8 (Fallback)" --> FallbackExtraction["Structured Entity/JSON State"]
-        FallbackExtraction --> ValidatedContext
-        
-        ValidatedContext --> WritingAgent["Writing Agent Policy (pi_theta)<br/>(Qwen2.5-7B + QLoRA + Test-Time CoT)"]
+        ContextState --> WritingAgent["Writing Agent Policy (pi_theta)<br/>(Qwen2.5-7B + QLoRA + Test-Time CoT)"]
         ChapterBlueprint --> WritingAgent
         
-        WritingAgent --> Rollouts["G Candidate Rollouts (o_i^(1) ... o_i^(G))"]
+        WritingAgent --> PostGate["0-Token Hygiene Gates<br/>(Artifact Cleaner + Paragraph Dedup Gate)"]
+        PostGate --> Rollouts["Clean Chapter / G Candidate Rollouts"]
     end
 
     subgraph REWARDS ["3-COMPONENT INTRINSIC REWARD ENGINE"]
@@ -92,41 +89,29 @@ Module chịu trách nhiệm xây dựng cốt truyện toàn cục theo chuẩn
 
 ---
 
-### 2.2. Module `src/coordinator.py` (Context Coordination & Context Gate)
+### 2.2. Module `src/coordinator.py` (Two-Tier Context Coordination)
 
-Module giải quyết bài toán suy giảm ngữ cảnh (*Lost-in-the-Middle*) và ảo giác dây chuyền (*Hallucination Cascades*) khi viết truyện dài qua nhiều chương.
+Module giải quyết bài toán suy giảm ngữ cảnh (*Lost-in-the-Middle*) khi viết truyện dài qua nhiều chương mà không tốn chi phí validator bên ngoài (tầng Validator cũ đã bị loại bỏ hoàn toàn sau thực nghiệm ablation).
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Hist as Past Chapters C_{1...i-1}
     participant Coord as CoordinatorAgent (ReIO)
-    participant Gate as ContextGateValidator (V_s)
     participant Writer as WritingAgent (pi_theta)
+    participant Hygiene as Artifact Cleaner & Dedup Gate
 
-    Hist->>Coord: Gửi toàn bộ văn bản các chương trước
-    Coord->>Coord: Nén ngữ cảnh thành s_i (< 4096 tokens)
-    Coord->>Gate: Gửi đề xuất tóm tắt s_i & đuôi chương trước C_{i-1}
-    Gate->>Gate: Tính S_faith (Tính trung thực) & S_comp (Tính đầy đủ)
-    alt V_s >= 0.8 (Đạt chuẩn)
-        Gate->>Writer: Chuyển giao s_i đã kiểm định
-    else V_s < 0.8 (Ảo giác hoặc thiếu sót)
-        Gate->>Gate: Kích hoạt Heuristic Fallback State Extraction
-        Gate->>Writer: Chuyển giao State JSON dự phòng
-    end
+    Hist->>Coord: Gửi đuôi chương gần nhất & lịch sử kế hoạch
+    Coord->>Coord: Nén ngữ cảnh thành Two-Tier State s_i (< 4096 tokens)
+    Coord->>Writer: Chuyển giao s_i + 180 từ cuối nguyên văn
+    Writer->>Hygiene: Sinh văn bản chương C_i (<think> + prose)
+    Hygiene->>Hist: Lọc sạch token đặc biệt & cắt đoạn lặp (>30 từ) trước khi lưu
 ```
 
-#### Các lớp chính:
-1. **`CoordinatorAgent` (Cơ chế ReIO - Rewrite Input and Output)**:
-   - Thu gọn toàn bộ lịch sử các chương trước thành trạng thái cô đọng $s_i$ (<4.000 tokens):
-     - `plot_summary`: Tiến trình các sự kiện thực tế đã diễn ra.
-     - `character_statuses`: Trạng thái tâm lý, thể chất của các nhân vật.
-     - `pending_threads`: Các nút thắt chưa giải quyết cần đưa vào chương mới.
-     - `recent_tail_excerpt`: Đoạn kết (~150 từ) của chương $C_{i-1}$ để làm móc nối.
-2. **`ContextGateValidator` (Cổng kiểm định $V_s$)**:
-   - Đo lường chất lượng bản tóm tắt qua công thức:
-     $$V_s(s_i) = 0.5 \cdot S_{\text{faith}}(s_i, C_{i-1}) + 0.5 \cdot S_{\text{comp}}(s_i, E_{i-1})$$
-   - **Ngưỡng $\tau = 0.8$**: Nếu $V_s < 0.8$, hệ thống từ chối bản tóm tắt tự do và kích hoạt cơ chế `_heuristic_fallback_state` để trích xuất thực thể cứng, bảo đảm không truyền ảo giác vào chương tiếp theo.
+#### Lớp chính:
+- **`CoordinatorAgent` (Cơ chế ReIO - Rewrite Input and Output)**:
+  - Thu gọn lịch sử các chương trước thành trạng thái 2 tầng $s_i$ (<4.000 tokens): `long_term_memory` (`major_events`, `character_states`, `unresolved_plot_threads`, `revealed_secrets`) và `short_term_memory` (`recent_chapter_summary`, `recent_tail_excerpt` 180 từ cuối nguyên văn).
+  - Chỉ tự động rơi về `_structured_state_extraction` khi chạy offline hoặc LLM lỗi định dạng JSON.
 
 ---
 
@@ -220,7 +205,7 @@ graph LR
 | `PlanCriticAgent` | `planning.py` | Kiểm duyệt tính hợp lệ và phụ thuộc của dàn ý | Rule-based |
 | `PlanningAgent` | `planning.py` | Chia chương và gán ngân sách từ cho từng cảnh | Rule-based / LLM |
 | `CoordinatorAgent` | `coordinator.py` | Nén ngữ cảnh lịch sử ReIO ($s_i < 4096$ tokens) | Đông cứng (Inference-Only) |
-| `ContextGateValidator` | `coordinator.py` | Thẩm định tính trung thực & đầy đủ ($V_s \ge 0.8$) | Heuristic / Small NLI |
+| `Artifact Cleaner & Dedup Gate` | `pipeline.py` | Xóa token đặc biệt & cắt/retry đoạn lặp (>30 từ) | Python/Regex 0-token |
 | `CompositeRewardEngine` | `rewards.py` | Động cơ tổng hợp 3 hàm thưởng nội tại | Không tham số (Frozen Evaluators) |
 | `VLLMWritingPolicy` | `pipeline.py` | Điều phối sinh rollout song song | Base Engine |
 | `IntrinsicRewardFunctions` | `scripts/train.py` | Cầu nối giữa CompositeRewardEngine và TRL | Adapter Pattern |
