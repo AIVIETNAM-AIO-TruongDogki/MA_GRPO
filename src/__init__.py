@@ -11,7 +11,13 @@ Core Modules:
 """
 
 from .coordinator import ContextGateValidator, CoordinatorAgent
-from .dataset_generator import CANONICAL_20_PREMISES, PilotDatasetGenerator
+from .dataset_generator import (
+    CANONICAL_20_PREMISES,
+    ConditionDGRPODatasetGenerator,
+    PilotDatasetGenerator,
+    load_premises_pool,
+    normalize_premise_text,
+)
 from .pipeline import MAGRPOPipeline, VLLMWritingPolicy, extract_cot_and_prose, resolve_optimal_dtype
 from .planning import (
     STORY_ARC_STAGES,
@@ -41,5 +47,8 @@ __all__ = [
     "extract_cot_and_prose",
     "resolve_optimal_dtype",
     "PilotDatasetGenerator",
+    "ConditionDGRPODatasetGenerator",
+    "load_premises_pool",
+    "normalize_premise_text",
     "CANONICAL_20_PREMISES",
 ]

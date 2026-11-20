@@ -50,12 +50,10 @@ _STORY_ARC_ALIASES: Dict[str, str] = {
 
 
 EVENT_GENERATION_PROMPT = """Generate a structured Macro Event Graph outline based on the premise.
-Tag EVERY event with its dramatic Story Arc stage from:
-[Exposition, Rising Action, Climax, Falling Action, Resolution].
+Allow the narrative structure, pacing, and dramatic trajectory to evolve organically to best fit the story and genre (do not force a rigid formula).
 
 Follow this exact format for each event:
 Event 1: [Event Title]
-Story Arc: [Exposition | Rising Action | Climax | Falling Action | Resolution]
 Setting: [Time and Location]
 Character: [Characters involved and their roles]
 Action: [What happens in this event]
@@ -64,7 +62,7 @@ Plot Twist: [Unexpected revelation or turning point]
 Depends On: [None or Event IDs e.g. E1]
 
 Event 2: [Event Title]
-Story Arc: ...
+Setting: ...
 """
 
 

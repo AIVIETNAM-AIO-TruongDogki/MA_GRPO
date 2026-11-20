@@ -19,10 +19,9 @@ from src.planning import (
 
 
 NEXT_CHAPTER_MACRO_PROMPT = """Given the preceding story chapters, generate the Macro Event Plan for the NEXT chapter ONLY.
-Include Story Arc stage, Setting, Characters, Core Action, Conflict, Plot Twist, and Causal Link to prior chapters.
+Include Setting, Characters, Core Action, Conflict, Plot Twist, and Causal Link to prior chapters.
 Follow the exact fields:
 Event 1: [Next Chapter Core Event]
-Story Arc: [Exposition | Rising Action | Climax | Falling Action | Resolution]
 Setting: [Time and Location]
 Character: [Active Characters]
 Action: [Core plot progression]

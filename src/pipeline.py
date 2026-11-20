@@ -229,8 +229,6 @@ class VLLMWritingPolicy:
         scene_outline = chapter_plan.get("scene_outline", [])
         outline_str = "\n- ".join(scene_outline) if scene_outline else chapter_plan.get("chapter_goal", "")
         target_words = chapter_plan.get("target_words", 1200)
-        story_arc = chapter_plan.get("story_arc")
-        arc_line = f"\nNarrative Arc Stage: {story_arc}" if story_arc else ""
         conflict_directive = (
             f"\n[DIRECTIVE WARNING]: {chapter_plan['injected_contradiction']}"
             if chapter_plan.get("injected_contradiction")
@@ -255,7 +253,7 @@ class VLLMWritingPolicy:
             "DO NOT include scene labels, section titles, or meta-commentary.\n"
         )
 
-        return f"""You are an elite literary novelist. Write the complete narrative prose for {chapter_plan.get('chapter_title', 'Chapter')}.{arc_line}
+        return f"""You are an elite literary novelist. Write the complete narrative prose for {chapter_plan.get('chapter_title', 'Chapter')}.
 Total Target Length: Approximately {target_words} words.
 
 [CONTEXT SUMMARY]:

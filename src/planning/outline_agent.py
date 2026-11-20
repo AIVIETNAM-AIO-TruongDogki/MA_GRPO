@@ -53,8 +53,8 @@ class OutlineAgent:
         if self.generate_fn:
             user_prompt = (
                 f"Premise: {premise}\nGenre: {genre}\n"
-                f"Generate exactly {num_events} consecutive events spanning the full 5-stage Story Arc "
-                f"(Exposition -> Rising Action -> Climax -> Falling Action -> Resolution)."
+                f"Generate exactly {num_events} consecutive causal events forming a coherent, engaging narrative "
+                f"with organic pacing and explicit causal dependencies (Depends On)."
             )
             for _ in range(self.max_retries):
                 try:

@@ -1146,12 +1146,10 @@ def audit_hypotheses_h1_to_h4(summary_by_condition: Dict[str, Dict[str, Any]]) -
     if cond_c and cond_d:
         sc_d = cond_d.get("S_causal", 0.0)
         sc_c = cond_c.get("S_causal", 0.0)
-        arc_d = cond_d.get("S_arc", 0.0)
         audit["H2_macro_graph_advantage"] = {
-            "supported": sc_d > sc_c and arc_d > 0.5,
+            "supported": sc_d > sc_c,
             "S_causal_D": sc_d,
             "S_causal_C": sc_c,
-            "S_arc_D": arc_d,
         }
 
     # H3
