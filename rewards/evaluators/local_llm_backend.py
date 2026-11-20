@@ -71,6 +71,7 @@ class LocalHF4BitJudgeBackend:
             "trust_remote_code": True,
             "low_cpu_mem_usage": True,
             "device_map": {"": self.device} if torch.cuda.is_available() else "auto",
+            "attn_implementation": "sdpa",
         }
         if "awq" in lower_id:
             load_kwargs["torch_dtype"] = torch.float16

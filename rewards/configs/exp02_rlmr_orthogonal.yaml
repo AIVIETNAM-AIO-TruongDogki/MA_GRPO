@@ -7,7 +7,7 @@ evaluator:
   backend: "local_hf_4bit"
   model_id: "unsloth/Qwen2.5-32B-Instruct-bnb-4bit"
   device: "cuda:0"
-  eval_batch_size: 2
+  eval_batch_size: 4
   max_input_tokens: 3584
   single_pass: true
   include_evidence: false

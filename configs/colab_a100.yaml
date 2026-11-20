@@ -1,5 +1,6 @@
 model:
   name: "Qwen/Qwen2.5-7B-Instruct"
+  use_4bit: false
   use_flash_attention_2: false
 
 lora:
@@ -19,15 +20,15 @@ lora:
 training:
   learning_rate: 3.0e-6
   max_steps: 500
-  per_device_train_batch_size: 1
-  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 1
   logging_steps: 2
   save_steps: 10
   kl_beta: 0.06
 
 rollout:
   group_size: 4
-  max_tokens: 2200
+  max_tokens: 1950
 
 rewards:
   weights:

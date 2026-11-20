@@ -61,10 +61,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "checkpoints" / "ma-grpo"))
     parser.add_argument("--max-steps", type=int, default=None, help="Overrides training.max_steps in config.")
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=None, help="Overrides training.per_device_train_batch_size.")
     parser.add_argument("--gradient-accumulation", type=int, default=None)
     parser.add_argument("--group-size", type=int, default=None, help="GRPO candidates per prompt (G).")
     parser.add_argument("--max-completion-tokens", type=int, default=None)
+    parser.add_argument(
+        "--policy-bf16",
+        action="store_true",
+        help="Load the 7B policy in native bf16 LoRA instead of 4-bit QLoRA (~2.5x faster generation on A100 80GB).",
+    )
     parser.add_argument("--save-steps", type=int, default=None, help="Overrides training.save_steps in config.")
     parser.add_argument("--reward-device", default=None, help="e.g. cuda:1, cuda:0, or cpu.")
     parser.add_argument("--resume-from-checkpoint", default=None)
@@ -403,7 +408,9 @@ def main() -> None:
     model_cfg = config.get("model", {})
 
     if not torch.cuda.is_available():
-        raise SystemExit("CUDA is required for QLoRA GRPO training.")
+        raise SystemExit("CUDA is required for QLoRA/LoRA GRPO training.")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     set_seed(args.seed)
     dataset = load_training_dataset(args.dataset)
     LOG.info("Loaded %d chapter prompts from %s", len(dataset), args.dataset)
@@ -413,20 +420,28 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    quantization = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-        bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        quantization_config=quantization,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-        device_map="auto",
-        attn_implementation="flash_attention_2" if model_cfg.get("use_flash_attention_2", False) else None,
-        trust_remote_code=True,
-    )
+    compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    use_4bit = (not args.policy_bf16) and bool(model_cfg.get("use_4bit", True))
+    attn_impl = "flash_attention_2" if model_cfg.get("use_flash_attention_2", False) else "sdpa"
+
+    model_load_kwargs: Dict[str, Any] = {
+        "torch_dtype": compute_dtype,
+        "device_map": "auto",
+        "attn_implementation": attn_impl,
+        "trust_remote_code": True,
+    }
+    if use_4bit:
+        model_load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=True,
+        )
+        LOG.info("Loading policy %s in 4-bit NF4 QLoRA (attn=%s)", args.model, attn_impl)
+    else:
+        LOG.info("Loading policy %s in native %s LoRA (attn=%s)", args.model, compute_dtype, attn_impl)
+
+    model = AutoModelForCausalLM.from_pretrained(args.model, **model_load_kwargs)
     model.config.use_cache = False
     model = get_peft_model(
         model,
@@ -442,19 +457,24 @@ def main() -> None:
     model.print_trainable_parameters()
 
     group_size = args.group_size or int(rollout_cfg.get("group_size", 4))
-    max_tokens = args.max_completion_tokens or int(rollout_cfg.get("max_tokens", 1500))
+    max_tokens = args.max_completion_tokens or int(rollout_cfg.get("max_tokens", 1950))
     output_dir = str(args.output_dir)
 
-    grad_accum = args.gradient_accumulation or int(train_cfg.get("gradient_accumulation_steps", 4))
-    if (args.batch_size * grad_accum) % group_size != 0:
-        target_accum = max(1, group_size // max(1, args.batch_size))
+    batch_size = args.batch_size if args.batch_size is not None else int(train_cfg.get("per_device_train_batch_size", 1))
+    grad_accum = (
+        args.gradient_accumulation
+        if args.gradient_accumulation is not None
+        else int(train_cfg.get("gradient_accumulation_steps", 4))
+    )
+    if (batch_size * grad_accum) % group_size != 0:
+        target_accum = max(1, group_size // max(1, batch_size))
         LOG.warning(
             "TRL GRPO requires (batch_size * gradient_accumulation) to be divisible by num_generations. "
             "Auto-adjusting gradient_accumulation_steps from %d to %d (group_size=%d, batch_size=%d).",
             grad_accum,
             target_accum,
             group_size,
-            args.batch_size,
+            batch_size,
         )
         grad_accum = target_accum
 
@@ -462,7 +482,7 @@ def main() -> None:
         "output_dir": output_dir,
         "learning_rate": float(train_cfg.get("learning_rate", 5e-6)),
         "max_steps": args.max_steps if args.max_steps is not None else int(train_cfg.get("max_steps", 500)),
-        "per_device_train_batch_size": args.batch_size,
+        "per_device_train_batch_size": batch_size,
         "gradient_accumulation_steps": grad_accum,
         "logging_steps": int(train_cfg.get("logging_steps", 2)),
         "save_steps": args.save_steps if args.save_steps is not None else int(train_cfg.get("save_steps", 10)),
