@@ -1,0 +1,20 @@
+{
+  "condition": "D",
+  "enable_micro_subevents": false,
+  "freytag_enforced": false,
+  "output_file": "/content/drive/MyDrive/MA-GRPO-Dataset/grpo_train_condition_d.jsonl",
+  "macro_plans_file": "/content/drive/MyDrive/MA-GRPO-Dataset/grpo_train_condition_d_macro_plans.json",
+  "total_premises_requested": 80,
+  "completed_premises": 80,
+  "valid_chapter_samples": 640,
+  "newly_generated_samples": 640,
+  "quarantined_failure_count": 0,
+  "excluded_leakage_count": 0,
+  "mean_target_words": 1123.44,
+  "min_target_words": 1000,
+  "max_target_words": 1250,
+  "mean_planning_tokens": 704.86,
+  "non_empty_tail_ratio_ch2_plus": 1.0,
+  "mock_tail_count": 0,
+  "elapsed_seconds": 1505.42
+}

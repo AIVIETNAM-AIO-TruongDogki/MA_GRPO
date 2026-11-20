@@ -1,0 +1,27 @@
+# EXP-04: Global-Only Chapter Reward (32B Local 4-bit Judge + Python/MiniLM Constraints)
+mode: "global_only"
+evaluator:
+  backend: "local_hf_4bit"
+  model_id: "unsloth/Qwen2.5-32B-Instruct-bnb-4bit"
+  device: "cuda:0"
+  eval_batch_size: 2
+  max_input_tokens: 3584
+  single_pass: false
+  include_evidence: false
+aggregation:
+  global_weights:
+    macro_adherence: 0.30
+    chapter_coherence: 0.30
+    character_consistency: 0.20
+    narrative_progression: 0.20
+constraints:
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  device: "cuda:0"
+  use_embedder: true
+  redundancy_cos_threshold: 0.78
+  max_think_words: 400
+penalties:
+  lambda_rep: 0.10
+  lambda_contra: 0.20
+  lambda_length: 0.10
+  lambda_format: 0.05

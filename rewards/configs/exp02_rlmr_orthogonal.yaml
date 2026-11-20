@@ -1,0 +1,32 @@
+# EXP-02-RLMR (Recommended Minimal Orthogonal RLMR — AAAI 2026 Adapted, gamma = 0.05)
+# Vế 1 (32B Local 4-bit Judge): r_i = 0.65 * R_global + 0.35 * R_local (semantic expansion & consistency)
+# Vế 2 (100% Python < 1ms, 0 MiniLM, 0 fixed lambdas): V(o_i) = V_length AND V_format AND V_no_loop
+# Ghép động theo group GRPO: delta = max(0, (n * r_max_vio + n * 0.05 - sum(r)) / (n - k))
+mode: "hierarchical"
+evaluator:
+  backend: "local_hf_4bit"
+  model_id: "unsloth/Qwen2.5-32B-Instruct-bnb-4bit"
+  device: "cuda:0"
+  eval_batch_size: 2
+  max_input_tokens: 3584
+  single_pass: true
+  include_evidence: false
+aggregation:
+  alpha_global: 0.65
+  local_weights:
+    event_realization: 0.35
+    causal_development: 0.35
+    meaningful_elaboration: 0.30
+  global_weights:
+    macro_adherence: 0.30
+    chapter_coherence: 0.30
+    character_consistency: 0.20
+    narrative_progression: 0.20
+constraints:
+  use_embedder: false
+  max_think_words: 400
+penalties:
+  penalty_mode: "rlmr_orthogonal"
+  rlmr_gamma: 0.05
+  min_len_ratio: 0.85
+  max_len_ratio: 1.15

@@ -54,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", required=True, help="JSONL training data with a `prompt` column.")
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct", help="Hugging Face model ID or local path.")
     parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "server_40gb.yaml"), help="MA-GRPO YAML config.")
+    parser.add_argument(
+        "--reward-config",
+        default=None,
+        help="Optional Phase 2 reward YAML config (e.g. rewards/configs/exp02_hierarchical.yaml). Omit to use Phase 1 baseline rewards.",
+    )
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "checkpoints" / "ma-grpo"))
     parser.add_argument("--max-steps", type=int, default=None, help="Overrides training.max_steps in config.")
     parser.add_argument("--batch-size", type=int, default=1)
@@ -232,6 +237,97 @@ class IntrinsicRewardFunctions:
         return self._components(completions, **kwargs)["quality"]
 
 
+class Phase2GRPORewardAdapter:
+    """TRL GRPOTrainer adapter wrapping Phase2RewardEngine (32B Local 4-bit Judge + Python/MiniLM Constraints)."""
+
+    __name__ = "phase2_rlmr_reward"
+
+    def __init__(self, reward_config_path: str, output_dir: str, device: str | None = None) -> None:
+        self.reward_config_path = reward_config_path
+        self.output_dir = output_dir
+        self.device = device
+        self._engine = None
+
+    @property
+    def engine(self):
+        if self._engine is None:
+            from rewards.aggregation import Phase2RewardEngine, load_reward_config
+
+            cfg = load_reward_config(self.reward_config_path)
+            if self.device:
+                cfg.setdefault("evaluator", {})["device"] = self.device
+                cfg.setdefault("constraints", {})["device"] = self.device
+            log_path = Path(self.output_dir) / "phase2_reward_logs.jsonl"
+            LOG.info(
+                "Initializing Phase2RewardEngine (mode=%s, config=%s, log=%s)",
+                cfg.get("mode", "hierarchical"),
+                self.reward_config_path,
+                log_path,
+            )
+            self._engine = Phase2RewardEngine(config=cfg, log_jsonl_path=log_path)
+        return self._engine
+
+    def __call__(self, completions: Sequence[Any], **kwargs: Any) -> List[float]:
+        import json
+        from rewards.base import EvaluationInput
+
+        texts = [_as_text(item) for item in completions]
+        count = len(texts)
+
+        raw_prompts = kwargs.get("prompts")
+        prompts = [_as_text(p) for p in _per_item(raw_prompts, count, "")] if raw_prompts is not None else [""] * count
+        targets = (
+            [int(v) for v in _per_item(kwargs.get("target_words"), count, 1125)]
+            if kwargs.get("target_words") is not None
+            else [extract_target_words_from_text(p, 1125) for p in prompts]
+        )
+        contexts = (
+            [str(v) for v in _per_item(kwargs.get("context_summary"), count, "")]
+            if kwargs.get("context_summary") is not None
+            else [extract_context_from_prompt(p) for p in prompts]
+        )
+        tails = (
+            [str(v) for v in _per_item(kwargs.get("prev_chapter_tail"), count, "")]
+            if kwargs.get("prev_chapter_tail") is not None
+            else [extract_tail_from_prompt(p) for p in prompts]
+        )
+        goals = [str(v) for v in _per_item(kwargs.get("chapter_goal"), count, "")]
+        titles = [str(v) for v in _per_item(kwargs.get("chapter_title"), count, "")]
+        scenes_list = _per_item(kwargs.get("scene_outline"), count, [])
+        chars_list = _per_item(kwargs.get("characters_active"), count, [])
+        ltm_raw = _per_item(kwargs.get("long_term_memory_json"), count, "{}")
+        ch_indices = [int(v) for v in _per_item(kwargs.get("chapter_index"), count, 1)]
+        pids = [str(v) for v in _per_item(kwargs.get("premise_id"), count, "")]
+
+        eval_items = []
+        for idx in range(count):
+            try:
+                ltm_dict = json.loads(ltm_raw[idx]) if isinstance(ltm_raw[idx], str) else (ltm_raw[idx] or {})
+            except Exception:
+                ltm_dict = {}
+            sc = list(scenes_list[idx]) if isinstance(scenes_list[idx], (list, tuple)) else []
+            ch = list(chars_list[idx]) if isinstance(chars_list[idx], (list, tuple)) else []
+            eval_items.append(
+                EvaluationInput(
+                    generated_chapter=texts[idx],
+                    target_words=targets[idx],
+                    chapter_title=titles[idx],
+                    chapter_goal=goals[idx],
+                    scene_outline=[str(s) for s in sc],
+                    characters_active=[str(c) for c in ch],
+                    context_summary=contexts[idx],
+                    prev_chapter_tail=tails[idx],
+                    long_term_memory=ltm_dict if isinstance(ltm_dict, dict) else {},
+                    prompt_text=prompts[idx],
+                    chapter_index=ch_indices[idx],
+                    premise_id=pids[idx],
+                )
+            )
+
+        breakdowns = self.engine.evaluate_batch(eval_items)
+        return [float(bd.r_total) for bd in breakdowns]
+
+
 def load_training_dataset(path: str):
     """Load and validate JSONL while retaining all rich metadata from dataset_generator for reward functions."""
     from datasets import load_dataset
@@ -265,11 +361,14 @@ def load_training_dataset(path: str):
             or ""
         )
 
+        import json as _json
+
         res = dict(row)
         res["prompt"] = prompt
         res["target_words"] = target_words
         res["context_summary"] = ctx_summary
         res["prev_chapter_tail"] = prev_tail
+        res["long_term_memory_json"] = _json.dumps(ctx_state.get("long_term_memory") or {}, ensure_ascii=False)
         return res
 
     return dataset.map(normalise, desc="Validating MA-GRPO records")
@@ -367,6 +466,7 @@ def main() -> None:
         "gradient_accumulation_steps": grad_accum,
         "logging_steps": int(train_cfg.get("logging_steps", 2)),
         "save_steps": args.save_steps if args.save_steps is not None else int(train_cfg.get("save_steps", 10)),
+        "save_total_limit": int(train_cfg.get("save_total_limit", 5)),
         "num_generations": group_size,
         "max_prompt_length": int(train_cfg.get("max_prompt_length", 1536)),
         "max_completion_length": max_tokens,
@@ -381,13 +481,24 @@ def main() -> None:
 
     reward_device = args.reward_device
     if reward_device is None:
-        reward_device = "cuda:1" if torch.cuda.device_count() > 1 else "cpu"
-    intrinsic_rewards = IntrinsicRewardFunctions(args.config, reward_device)
+        reward_device = "cuda:1" if torch.cuda.device_count() > 1 else ("cuda:0" if args.reward_config else "cpu")
+
+    if args.reward_config:
+        phase2_reward = Phase2GRPORewardAdapter(
+            reward_config_path=args.reward_config,
+            output_dir=output_dir,
+            device=reward_device,
+        )
+        reward_funcs = [phase2_reward]
+    else:
+        intrinsic_rewards = IntrinsicRewardFunctions(args.config, reward_device)
+        reward_funcs = [intrinsic_rewards.length, intrinsic_rewards.coherence, intrinsic_rewards.quality]
+
     trainer_values = {
         "model": model,
         "args": training_args,
         "train_dataset": dataset,
-        "reward_funcs": [intrinsic_rewards.length, intrinsic_rewards.coherence, intrinsic_rewards.quality],
+        "reward_funcs": reward_funcs,
         "processing_class": tokenizer,
         "tokenizer": tokenizer,  # older TRL releases use this name
     }

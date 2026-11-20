@@ -1,0 +1,11 @@
+# EXP-00: Baseline Phase 1 Intrinsic Rewards (src/rewards.py — 0 LLM Judge)
+mode: "baseline_v2"
+constraints:
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  device: "cuda:0"
+  use_embedder: true
+baseline_rewards:
+  weights:
+    w_length: 0.40
+    w_coherence: 0.30
+    w_quality: 0.30
