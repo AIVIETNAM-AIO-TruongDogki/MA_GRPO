@@ -52,7 +52,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--judge-backend",
-        choices=["none", "mock", "api", "local_vllm"],
+        choices=["none", "mock", "api", "local_vllm", "local_hf"],
         default="none",
         help="Judge LLM backend for ConStory-Checker, EQ-Bench Longform, and Blind Pairwise.",
     )
