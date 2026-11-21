@@ -24,9 +24,50 @@ from src.rewards import calculate_anti_context_ratio, calculate_length_reward, s
 
 
 _LEAKED_ARTIFACT_RE = re.compile(
-    r"(?:</assistant>|<\|im_end\|>|<\|im_start\|>|\[/?INST\]|^\s*Scene\s+\d+\s*[:(\[])",
-    flags=re.IGNORECASE | re.MULTILINE,
+    r"(?:</assistant>|<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|\[/?INST\]|</s>)",
+    flags=re.IGNORECASE,
 )
+
+
+def _split_think_and_prose(raw_text: str) -> tuple[str, int, bool]:
+    """Extract (clean_prose, think_words, unclosed_think) robustly.
+
+    Handles both standard `<think>...</think>prose` and implicit-open `...</think>prose`
+    (which happens when prompts end with `Begin with <think> now:` and the model omits `<think>`).
+    """
+    text = raw_text or ""
+    has_open = bool(re.search(r"<think>", text, flags=re.IGNORECASE))
+    has_close = bool(re.search(r"</think>", text, flags=re.IGNORECASE))
+
+    if has_open and has_close:
+        think_blocks = re.findall(r"<think>([\s\S]*?)</think>", text, flags=re.IGNORECASE)
+        think_words = sum(len(b.split()) for b in think_blocks)
+        clean_prose = strip_think_tags(text)
+        unclosed_think = False
+    elif has_close and not has_open:
+        # Prompt already cued <think>; everything before the first </think> is reasoning
+        parts = re.split(r"</think>", text, maxsplit=1, flags=re.IGNORECASE)
+        think_words = len(parts[0].split())
+        clean_prose = parts[1].strip() if len(parts) > 1 else ""
+        unclosed_think = False
+    elif has_open and not has_close:
+        think_words = len(re.sub(r"<think>", "", text, flags=re.IGNORECASE).split())
+        clean_prose = ""
+        unclosed_think = True
+    else:
+        think_words = 0
+        clean_prose = text.strip()
+        unclosed_think = False
+
+    return clean_prose, think_words, unclosed_think
+
+
+def _has_clean_ending(clean_prose: str) -> bool:
+    """Allow standard sentence punctuation as well as markdown italics/scene breaks & ellipses."""
+    trimmed = (clean_prose or "").rstrip(" \t\r\n*_~`")
+    if not trimmed:
+        return False
+    return trimmed[-1] in '.!?"”’\'…)—-'
 
 
 def _jaccard_tokens(a: str, b: str) -> float:
@@ -123,25 +164,23 @@ class ConstraintEvaluator:
         }
 
     def _compute_format_penalty(self, raw_text: str, clean_prose: str) -> Dict[str, Any]:
-        think_blocks = re.findall(r"<think>([\s\S]*?)</think>", raw_text or "", flags=re.IGNORECASE)
-        think_words = sum(len(b.split()) for b in think_blocks)
-        has_open = bool(re.search(r"<think>", raw_text or "", flags=re.IGNORECASE))
-        has_close = bool(re.search(r"</think>", raw_text or "", flags=re.IGNORECASE))
+        parsed_prose, think_words, unclosed_think = _split_think_and_prose(raw_text)
+        prose_for_check = parsed_prose if parsed_prose else clean_prose
 
         pen = 0.0
-        if has_open and not has_close:
+        if unclosed_think:
             pen += 0.60  # Unclosed <think> wastes budget and corrupts prose
         if think_words > self.max_think_words:
             pen += min(0.40, ((think_words - self.max_think_words) / float(self.max_think_words)) * 0.40)
-        if _LEAKED_ARTIFACT_RE.search(clean_prose):
+        if _LEAKED_ARTIFACT_RE.search(prose_for_check):
             pen += 0.35
-        if clean_prose and clean_prose.strip()[-1] not in '.!?"”’\'':
+        if prose_for_check and not _has_clean_ending(prose_for_check):
             pen += 0.15  # Truncated mid-sentence ending
 
         return {
             "p_format": round(min(1.0, pen), 4),
             "think_words": think_words,
-            "unclosed_think": bool(has_open and not has_close),
+            "unclosed_think": unclosed_think,
         }
 
     @staticmethod
@@ -204,23 +243,19 @@ def verify_objective_constraints(
       3. V_no_loop : zero repeated long paragraphs (>30w) or looping intra-paragraph sentences (>12w)
     """
     raw_text = item.generated_chapter or ""
-    clean_prose = strip_think_tags(raw_text)
+    clean_prose, think_words, unclosed_think = _split_think_and_prose(raw_text)
     prose_words = len(clean_prose.split())
 
     target = max(1, int(item.target_words or 1125))
     l_low = int(round(target * min_len_ratio))
     l_high = int(round(target * max_len_ratio))
     v_length = l_low <= prose_words <= l_high
-    length_compliance = float(calculate_length_reward(raw_text, target_length=target, l_lower=l_low, l_upper=l_high))
+    length_compliance = float(calculate_length_reward(clean_prose, target_length=target, l_lower=l_low, l_upper=l_high))
 
-    think_blocks = re.findall(r"<think>([\s\S]*?)</think>", raw_text, flags=re.IGNORECASE)
-    think_words = sum(len(b.split()) for b in think_blocks)
-    has_open = bool(re.search(r"<think>", raw_text, flags=re.IGNORECASE))
-    has_close = bool(re.search(r"</think>", raw_text, flags=re.IGNORECASE))
-    unclosed_think = has_open and not has_close
     has_leak = bool(_LEAKED_ARTIFACT_RE.search(clean_prose))
-    clean_end = bool(clean_prose and clean_prose.strip()[-1] in '.!?"”’\'')
-    v_format = (not unclosed_think) and (think_words <= max_think_words) and (not has_leak) and clean_end
+    clean_end = _has_clean_ending(clean_prose)
+    think_ok = think_words <= max_think_words
+    v_format = (not unclosed_think) and think_ok and (not has_leak) and clean_end
 
     _, removed_dup_units = deduplicate_repeated_paragraphs(clean_prose, min_words=30, min_sentence_words=12)
     v_no_loop = removed_dup_units == 0
@@ -229,7 +264,16 @@ def verify_objective_constraints(
     if not v_length:
         failed.append(f"length({prose_words}w not in [{l_low},{l_high}])")
     if not v_format:
-        failed.append("format")
+        fmt_reasons: List[str] = []
+        if unclosed_think:
+            fmt_reasons.append("unclosed_think")
+        if not think_ok:
+            fmt_reasons.append(f"think={think_words}w>{max_think_words}w")
+        if has_leak:
+            fmt_reasons.append("leaked_tag")
+        if not clean_end:
+            fmt_reasons.append("truncated_end")
+        failed.append(f"format({'+'.join(fmt_reasons)})")
     if not v_no_loop:
         failed.append(f"loop(removed={removed_dup_units})")
 

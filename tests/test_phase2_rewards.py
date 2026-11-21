@@ -242,6 +242,34 @@ class TestPhase2ExpansionRewards(unittest.TestCase):
             self.assertTrue((out_dir / "offline_audit_report.md").exists())
             self.assertTrue((out_dir / "offline_reward_logs.jsonl").exists())
 
+    def test_rlmr_verifier_allows_scene_headings_markdown_endings_and_implicit_think(self):
+        from rewards.evaluators.constraint_evaluator import verify_objective_constraints
+
+        # 1. Scene heading + markdown italic ending + implicit leading </think> should PASS V_format
+        prose = "Scene 1: Arrival\n\n" + " ".join(
+            f"Detailed narrative beat number {i} moves Elena and Marcus steadily toward the sealed harbor vault."
+            for i in range(1, 22)
+        ) + " *The lantern flickered out...*"
+        implicit_text = "Plan three tight scenes within budget.\n</think>\n\n" + prose
+        v_ok = verify_objective_constraints(
+            EvaluationInput(generated_chapter=implicit_text, target_words=len(prose.split())),
+            max_think_words=400,
+        )
+        self.assertTrue(v_ok["v_format"], msg=f"Unexpected format failure: {v_ok}")
+        self.assertEqual(v_ok["think_words"], 6)
+        self.assertTrue(v_ok["is_compliant"])
+
+        # 2. Mid-sentence truncated ending MUST fail with explicit diagnostic reason
+        trunc_text = "<think>Short plan.</think>\n\n" + " ".join(
+            f"Sentence {i} builds suspense along the dock." for i in range(1, 35)
+        ) + " And then she reached for the"
+        v_trunc = verify_objective_constraints(
+            EvaluationInput(generated_chapter=trunc_text, target_words=280),
+            max_think_words=400,
+        )
+        self.assertFalse(v_trunc["v_format"])
+        self.assertTrue(any("truncated_end" in f for f in v_trunc["failed_constraints"]), msg=v_trunc)
+
 
 if __name__ == "__main__":
     unittest.main()

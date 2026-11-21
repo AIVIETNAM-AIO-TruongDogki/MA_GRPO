@@ -28,7 +28,7 @@ training:
 
 rollout:
   group_size: 4
-  max_tokens: 1950
+  max_tokens: 2300
 
 rewards:
   weights:
