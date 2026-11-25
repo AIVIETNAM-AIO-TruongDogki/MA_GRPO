@@ -20,6 +20,10 @@ export MAX_STEPS="${MAX_STEPS:-160}"
 export EVAL_PROMPTS="${EVAL_PROMPTS:-3}"
 export EVAL_OUT_DIR="${EVAL_OUT_DIR:-eval_outputs/${EXP_NAME}_vs_base_${EVAL_PROMPTS}prompts}"
 export PYTHON_BIN="${PYTHON_BIN:-python3}"
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+if [ -z "${HF_HOME:-}" ] && [ -d "/user-data" ]; then
+  export HF_HOME="/user-data/.hf_cache"
+fi
 
 echo "======================================================================"
 echo "[STEP 1/2] STARTING GRPO RLMR TRAINING (MAX_STEPS=${MAX_STEPS})"

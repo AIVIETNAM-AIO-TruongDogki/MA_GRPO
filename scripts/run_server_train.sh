@@ -26,6 +26,10 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export TOKENIZERS_PARALLELISM="false"
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+if [ -z "${HF_HOME:-}" ] && [ -d "/user-data" ]; then
+  export HF_HOME="/user-data/.hf_cache"
+fi
 
 # 1. Pre-flight VRAM check (prevent immediate OOM if another vLLM/training job is holding the GPU)
 if command -v nvidia-smi >/dev/null 2>&1; then
