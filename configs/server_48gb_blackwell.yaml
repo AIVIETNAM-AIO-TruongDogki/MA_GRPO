@@ -1,0 +1,57 @@
+# MA-GRPO Stage-2 QLoRA GRPO Configuration for 1x 48GB GPU (NVIDIA RTX PRO 6000 Blackwell)
+# Co-residency VRAM budget (~35-38 GB / 48 GB):
+#   - Policy Qwen2.5-7B-Instruct 4-bit NF4 QLoRA + grad ckpt (bs=2, ga=2): ~14-16 GB
+#   - Frozen Judge unsloth/Qwen2.5-32B-Instruct-bnb-4bit (eval_batch=2):   ~20-21 GB
+#   - Pure-Python RLMR Verifier (V_length AND V_format AND V_no_loop):       0 GB
+
+model:
+  name: "Qwen/Qwen2.5-7B-Instruct"
+  use_4bit: true
+  use_flash_attention_2: false
+
+lora:
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  bias: "none"
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+training:
+  learning_rate: 3.0e-6
+  max_steps: 160
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 2
+  max_prompt_length: 1536
+  logging_steps: 2
+  save_steps: 10
+  save_total_limit: 5
+  kl_beta: 0.06
+
+rollout:
+  group_size: 4
+  max_tokens: 2300
+
+rewards:
+  weights:
+    w_length: 0.40
+    w_coherence: 0.30
+    w_quality: 0.30
+
+  coherence:
+    embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+    tail_words: 150
+    head_words: 150
+
+  quality:
+    alpha_fluency: 0.40
+    beta_richness: 0.30
+    gamma_burstiness: 0.30
+    b_target: 11.0
+    tau_b: 4.0
