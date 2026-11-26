@@ -1,0 +1,71 @@
+# Experimental MA-GRPO Stage-2 QLoRA GRPO + Colocate vLLM Config for 1x 48GB GPU (RTX PRO 6000 Blackwell)
+# Tight Co-Residency VRAM Budget (~43-45 GB / 48.8 GB peak during generation wake-up):
+#   - Frozen Judge unsloth/Qwen2.5-32B-Instruct-bnb-4bit (eval_batch=2): ~19.5 GB
+#   - Policy Qwen2.5-7B-Instruct 4-bit NF4 QLoRA + AdamW:                ~6.5 GB
+#   - Colocate vLLM 7B bf16 + PagedAttention KV cache (mem_util=0.36):   ~17.5 GB (sleeps to CPU RAM during backward!)
+#
+# Recommended: smoke-test 2 steps first on a temp output dir before resuming a full run.
+
+model:
+  name: "Qwen/Qwen2.5-7B-Instruct"
+  use_4bit: true
+  use_flash_attention_2: false
+
+vllm:
+  use_vllm: true
+  mode: "colocate"
+  gpu_memory_utilization: 0.36
+  max_model_len: 4096
+  enable_sleep_mode: true
+  tensor_parallel_size: 1
+
+lora:
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  bias: "none"
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+training:
+  learning_rate: 1.5e-5
+  lr_scheduler_type: "cosine"
+  warmup_steps: 8
+  max_steps: 200
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 2
+  max_prompt_length: 1792
+  logging_steps: 2
+  save_steps: 10
+  save_total_limit: 5
+  kl_beta: 0.01
+
+rollout:
+  group_size: 4
+  max_tokens: 2300
+  temperature: 0.95
+  top_p: 0.95
+
+rewards:
+  weights:
+    w_length: 0.40
+    w_coherence: 0.30
+    w_quality: 0.30
+
+  coherence:
+    embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+    tail_words: 150
+    head_words: 150
+
+  quality:
+    alpha_fluency: 0.40
+    beta_richness: 0.30
+    gamma_burstiness: 0.30
+    b_target: 11.0
+    tau_b: 4.0

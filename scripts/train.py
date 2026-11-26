@@ -71,6 +71,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Load the 7B policy in native bf16 LoRA instead of 4-bit QLoRA (~2.5x faster generation on A100 80GB).",
     )
+    parser.add_argument(
+        "--use-vllm",
+        action="store_true",
+        help="Enable TRL vLLM rollout acceleration (overrides vllm.use_vllm in config).",
+    )
+    parser.add_argument(
+        "--vllm-mode",
+        default=None,
+        choices=["colocate", "server"],
+        help="TRL vLLM mode: 'colocate' (same GPU with sleep mode) or 'server'.",
+    )
+    parser.add_argument(
+        "--vllm-gpu-mem",
+        type=float,
+        default=None,
+        help="Overrides vllm.gpu_memory_utilization (e.g. 0.36 on 48GB GPU co-resident with 32B Judge).",
+    )
     parser.add_argument("--save-steps", type=int, default=None, help="Overrides training.save_steps in config.")
     parser.add_argument("--reward-device", default=None, help="e.g. cuda:1, cuda:0, or cpu.")
     parser.add_argument("--resume-from-checkpoint", default=None)
@@ -410,6 +427,17 @@ def main() -> None:
     rollout_cfg = config.get("rollout", {})
     lora_cfg = config.get("lora", {})
     model_cfg = config.get("model", {})
+    vllm_cfg = config.get("vllm", {})
+
+    use_vllm = bool(args.use_vllm or vllm_cfg.get("use_vllm", False))
+    if use_vllm:
+        try:
+            import vllm  # noqa: F401
+        except ImportError as error:
+            raise SystemExit(
+                "vLLM acceleration was requested (`--use-vllm` or `vllm.use_vllm: true`), "
+                f"but `vllm` is not installed in this Python environment. Original error: {error}"
+            ) from error
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for QLoRA/LoRA GRPO training.")
@@ -505,9 +533,29 @@ def main() -> None:
         "report_to": [] if args.report_to == "none" else [args.report_to],
         "remove_unused_columns": False,
     }
+    if use_vllm:
+        vllm_mode = str(args.vllm_mode or vllm_cfg.get("mode", "colocate"))
+        vllm_mem = float(args.vllm_gpu_mem if args.vllm_gpu_mem is not None else vllm_cfg.get("gpu_memory_utilization", 0.36))
+        vllm_max_len = int(vllm_cfg.get("max_model_len", 4096))
+        vllm_sleep = bool(vllm_cfg.get("enable_sleep_mode", True))
+        vllm_tp = int(vllm_cfg.get("tensor_parallel_size", 1))
+        grpo_values.update(
+            {
+                "use_vllm": True,
+                "vllm_mode": vllm_mode,
+                "vllm_gpu_memory_utilization": vllm_mem,
+                "vllm_max_model_len": vllm_max_len,
+                "vllm_enable_sleep_mode": vllm_sleep,
+                "vllm_tensor_parallel_size": vllm_tp,
+            }
+        )
+        vllm_summary = f"enabled(mode={vllm_mode}, mem={vllm_mem:.2f}, max_len={vllm_max_len}, sleep={vllm_sleep})"
+    else:
+        vllm_summary = "disabled(hf_sdpa)"
+
     training_args = GRPOConfig(**_supported(GRPOConfig, grpo_values))
     LOG.info(
-        "GRPO v3 config: lr=%.2e, beta=%.4f, temp=%.2f, top_p=%.2f, max_prompt=%d, max_comp=%d, G=%d, prompt_fmt=%s",
+        "GRPO v3 config: lr=%.2e, beta=%.4f, temp=%.2f, top_p=%.2f, max_prompt=%d, max_comp=%d, G=%d, prompt_fmt=%s, vllm=%s",
         grpo_values["learning_rate"],
         grpo_values["beta"],
         grpo_values["temperature"],
@@ -516,6 +564,7 @@ def main() -> None:
         grpo_values["max_completion_length"],
         grpo_values["num_generations"],
         "chat_messages" if isinstance(dataset[0]["prompt"], list) else "raw_string",
+        vllm_summary,
     )
 
     reward_device = args.reward_device
