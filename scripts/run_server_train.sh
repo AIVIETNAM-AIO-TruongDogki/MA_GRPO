@@ -14,7 +14,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-EXP_NAME="${EXP_NAME:-exp02_rlmr_orthogonal_32b_v2}"
+EXP_NAME="${EXP_NAME:-exp02_rlmr_orthogonal_32b_v3}"
 DATASET="${DATASET:-data/grpo_train_condition_d.jsonl}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-configs/server_48gb_blackwell.yaml}"
 REWARD_CONFIG="${REWARD_CONFIG:-rewards/configs/exp02_rlmr_orthogonal_48gb.yaml}"
@@ -26,7 +26,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export TOKENIZERS_PARALLELISM="false"
-export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-0}"
 if [ -z "${HF_HOME:-}" ] && [ -d "/user-data" ]; then
   export HF_HOME="/user-data/.hf_cache"
 fi

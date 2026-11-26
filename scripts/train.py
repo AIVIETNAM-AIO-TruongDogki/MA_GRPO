@@ -33,6 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.pipeline import build_writer_chat_messages
 from src.rewards import CompositeRewardEngine, extract_length_bounds
 
 
@@ -369,14 +370,17 @@ def load_training_dataset(path: str):
         import json as _json
 
         res = dict(row)
-        res["prompt"] = prompt
+        # Convert to conversational [system, user] messages so TRL GRPOTrainer applies the exact
+        # Qwen2.5 Instruct chat template + Variant C short-<think> paragraph-budget contract
+        # identically to evaluation (`scripts/eval_full_pipeline.py`).
+        res["prompt"] = build_writer_chat_messages(prompt, target_words=target_words, enable_cot=True)
         res["target_words"] = target_words
         res["context_summary"] = ctx_summary
         res["prev_chapter_tail"] = prev_tail
         res["long_term_memory_json"] = _json.dumps(ctx_state.get("long_term_memory") or {}, ensure_ascii=False)
         return res
 
-    return dataset.map(normalise, desc="Validating MA-GRPO records")
+    return dataset.map(normalise, desc="Validating MA-GRPO records (chat-template aligned)")
 
 
 def _supported(cls: type, values: Dict[str, Any]) -> Dict[str, Any]:
@@ -481,6 +485,8 @@ def main() -> None:
     grpo_values = {
         "output_dir": output_dir,
         "learning_rate": float(train_cfg.get("learning_rate", 5e-6)),
+        "lr_scheduler_type": str(train_cfg.get("lr_scheduler_type", "cosine")),
+        "warmup_steps": int(train_cfg.get("warmup_steps", 8)),
         "max_steps": args.max_steps if args.max_steps is not None else int(train_cfg.get("max_steps", 500)),
         "per_device_train_batch_size": batch_size,
         "gradient_accumulation_steps": grad_accum,
@@ -488,9 +494,11 @@ def main() -> None:
         "save_steps": args.save_steps if args.save_steps is not None else int(train_cfg.get("save_steps", 10)),
         "save_total_limit": int(train_cfg.get("save_total_limit", 5)),
         "num_generations": group_size,
-        "max_prompt_length": int(train_cfg.get("max_prompt_length", 1536)),
+        "max_prompt_length": int(train_cfg.get("max_prompt_length", 1792)),
         "max_completion_length": max_tokens,
-        "beta": float(train_cfg.get("kl_beta", 0.04)),
+        "temperature": float(rollout_cfg.get("temperature", 0.95)),
+        "top_p": float(rollout_cfg.get("top_p", 0.95)),
+        "beta": float(train_cfg.get("kl_beta", 0.01)),
         "bf16": torch.cuda.is_bf16_supported(),
         "fp16": not torch.cuda.is_bf16_supported(),
         "gradient_checkpointing": True,
@@ -498,6 +506,17 @@ def main() -> None:
         "remove_unused_columns": False,
     }
     training_args = GRPOConfig(**_supported(GRPOConfig, grpo_values))
+    LOG.info(
+        "GRPO v3 config: lr=%.2e, beta=%.4f, temp=%.2f, top_p=%.2f, max_prompt=%d, max_comp=%d, G=%d, prompt_fmt=%s",
+        grpo_values["learning_rate"],
+        grpo_values["beta"],
+        grpo_values["temperature"],
+        grpo_values["top_p"],
+        grpo_values["max_prompt_length"],
+        grpo_values["max_completion_length"],
+        grpo_values["num_generations"],
+        "chat_messages" if isinstance(dataset[0]["prompt"], list) else "raw_string",
+    )
 
     reward_device = args.reward_device
     if reward_device is None:

@@ -87,6 +87,48 @@ class TestBaseLengthDiagnostic(unittest.TestCase):
             chapters = [int(r["chapter_index"]) for r in picked]
             self.assertEqual(chapters, [1, 3, 5, 7])
 
+    def test_v3_train_eval_chat_template_alignment_and_idempotency(self) -> None:
+        from src.pipeline import (
+            VLLMWritingPolicy,
+            WRITER_SYSTEM_PROMPT_COT,
+            annotate_scene_paragraph_budgets,
+            build_writer_chat_messages,
+        )
+
+        # 1. Calling build_writer_chat_messages on v2 raw prompt vs freshly constructed prompt
+        msgs_from_v2 = build_writer_chat_messages(self.sample_row["prompt"], target_words=1000, enable_cot=True)
+        self.assertEqual(len(msgs_from_v2), 2)
+        self.assertEqual(msgs_from_v2[0]["role"], "system")
+        self.assertEqual(msgs_from_v2[0]["content"], WRITER_SYSTEM_PROMPT_COT)
+        self.assertEqual(msgs_from_v2[1]["role"], "user")
+        self.assertIn("3 full, detailed paragraphs", msgs_from_v2[1]["content"])
+        self.assertIn("5 full, detailed paragraphs", msgs_from_v2[1]["content"])
+        self.assertIn("4 full, detailed paragraphs", msgs_from_v2[1]["content"])
+        self.assertNotIn("CRITICAL WRITING INSTRUCTIONS:", msgs_from_v2[1]["content"])
+
+        # 2. Idempotency: re-wrapping eval's construct_prompt output produces identical messages
+        policy = VLLMWritingPolicy(use_mock=True)
+        ch_plan = {
+            "chapter_title": "Chapter 1: Test",
+            "chapter_goal": "Test goal.",
+            "target_words": 1000,
+            "characters_active": ["Alex"],
+            "scene_outline": [
+                "Scene 1 (~250 words) [Opening]: Action.",
+                "Scene 2 (~450 words) [Escalation]: Conflict.",
+                "Scene 3 (~300 words) [Turn]: Turn.",
+            ],
+        }
+        eval_user_prompt = policy.construct_prompt(ch_plan, {"plot_summary": "Init"}, enable_cot=True)
+        msgs_once = build_writer_chat_messages(eval_user_prompt, target_words=1000, enable_cot=True)
+        msgs_twice = build_writer_chat_messages(msgs_once[1]["content"], target_words=1000, enable_cot=True)
+        self.assertEqual(msgs_once, msgs_twice)
+        self.assertEqual(msgs_once[1]["content"].count("full, detailed paragraphs"), 3)
+        self.assertEqual(
+            annotate_scene_paragraph_budgets(msgs_once[1]["content"]),
+            msgs_once[1]["content"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

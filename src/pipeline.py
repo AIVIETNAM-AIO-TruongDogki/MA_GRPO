@@ -33,6 +33,104 @@ _ARTIFACT_TAG_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+WRITER_SYSTEM_PROMPT_COT = (
+    "You are an acclaimed literary novelist writing full-length chapters of approximately 1,000 words. "
+    "You NEVER summarize or rush scenes; you fully dramatize every beat with concrete sensory detail, "
+    "physical blocking, multi-turn character dialogue, and psychological depth so the chapter genuinely "
+    "reaches the target narrative length (about 11-13 rich paragraphs of 80-95 words each for a 1,000-word chapter). "
+    "You strictly obey formatting rules: your <think> block contains ONLY 4-6 short bullet points "
+    "(under 100 words total) and NEVER contains narrative prose or dialogue."
+)
+
+WRITER_SYSTEM_PROMPT_DIRECT = (
+    "You are an acclaimed literary novelist writing full-length chapters of approximately 1,000 words. "
+    "You NEVER summarize or rush scenes; you fully dramatize every beat with concrete sensory detail, "
+    "physical blocking, multi-turn character dialogue, and psychological depth so the chapter genuinely "
+    "reaches the target narrative length. Output ONLY clean narrative prose with zero headings, "
+    "scene labels, <think> tags, or author notes."
+)
+
+
+def annotate_scene_paragraph_budgets(text: str) -> str:
+    """Idempotently annotate `Scene N (~X words)` lines with explicit paragraph counts (~85w/para)."""
+    if not text or "full, detailed paragraphs)" in text:
+        return text
+
+    def _repl(match: re.Match) -> str:
+        prefix = match.group(1)
+        words = int(match.group(2))
+        paras = max(2, int(round(words / 85.0)))
+        return f"{prefix}(~{words} words — write {paras} full, detailed paragraphs)"
+
+    return re.sub(
+        r"(Scene\s+\d+\s*)\(~(\d+)\s*words\)",
+        _repl,
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
+def build_writer_chat_messages(
+    raw_prompt: str,
+    target_words: int = 1000,
+    enable_cot: bool = True,
+) -> List[Dict[str, str]]:
+    """Build synchronized [system, user] chat messages used identically across Training and Eval.
+
+    Proven by Base 7B diagnostic (`C_chat_budget_short_think`):
+      - 100% V_format & V_no_loop compliance (zero prose leaked inside `<think>`)
+      - Concise ~55-word bullet-only `<think>` plan
+      - Explicit per-scene paragraph budgets (~85w/paragraph) to counter Instruct brevity bias.
+    """
+    text = (raw_prompt or "").strip()
+    for marker in ("STRICT LENGTH & FORMAT REQUIREMENTS:", "CRITICAL WRITING INSTRUCTIONS:"):
+        idx = text.find(marker)
+        if idx != -1:
+            text = text[:idx].rstrip()
+            break
+
+    target = max(200, int(target_words or 1000))
+    l_low = int(round(target * 0.85))
+    l_high = int(round(target * 1.15))
+    total_paras = max(6, int(round(target / 85.0)))
+    core_body = annotate_scene_paragraph_budgets(text)
+
+    if enable_cot:
+        user_msg = (
+            f"{core_body}\n\n"
+            f"STRICT LENGTH & FORMAT REQUIREMENTS:\n"
+            f"1. Brief <think> Plan (MAX 80-100 words, bullet points ONLY):\n"
+            f"   - Start with <think> and write ONLY 4-6 concise bullet points mapping paragraph counts and transitions.\n"
+            f"   - DO NOT write any story sentences, descriptions, or dialogue inside <think>.\n"
+            f"   - Close </think> immediately after the bullets.\n"
+            f"2. Full Chapter Prose ({l_low}-{l_high} words, target ~{target} words):\n"
+            f"   - Immediately after </think>, write approximately {total_paras} rich paragraphs (~80-95 words each).\n"
+            f"   - Fully dramatize every scene with real-time action, sensory atmosphere, internal tension, and extended back-and-forth dialogue.\n"
+            f"   - NEVER summarize events in a few sentences, NEVER skip ahead, and NEVER stop early around 400-600 words.\n"
+            f"   - Do NOT include chapter/scene labels, markdown headings, or meta-commentary after </think>.\n"
+            f"   - End cleanly on a complete final sentence.\n"
+            f"Output <think>...</think> followed immediately by the complete ~{target}-word chapter:"
+        )
+        return [
+            {"role": "system", "content": WRITER_SYSTEM_PROMPT_COT},
+            {"role": "user", "content": user_msg},
+        ]
+
+    user_msg = (
+        f"{core_body}\n\n"
+        f"STRICT LENGTH & FORMAT REQUIREMENTS:\n"
+        f"- Target Prose Length: strictly between {l_low} and {l_high} words (aim right around {target} words).\n"
+        f"- Structure: write approximately {total_paras} substantial paragraphs (~80-95 words each) following the scene budgets above.\n"
+        f"- Dramatization: expand every scene in real time with concrete sensory texture, physical gestures, internal conflict, and multi-turn dialogue.\n"
+        f"- Anti-Brevity Rule: DO NOT summarize events, DO NOT wrap up early, and DO NOT repeat earlier paragraphs.\n"
+        f"- Clean Prose Only: DO NOT output <think> tags, scene labels, section titles, or author notes. End cleanly on a complete final sentence.\n"
+        f"Begin the complete ~{target}-word narrative prose immediately:"
+    )
+    return [
+        {"role": "system", "content": WRITER_SYSTEM_PROMPT_DIRECT},
+        {"role": "user", "content": user_msg},
+    ]
+
 
 def clean_generation_artifacts(text: str) -> str:
     """
@@ -217,15 +315,16 @@ class VLLMWritingPolicy:
                 print(f"[vLLM] Warning: vLLM engine unavailable ({e}). Falling back to mock generator.")
                 self.use_mock = True
 
-    def _format_vllm_prompt(self, prompt: str) -> str:
-        """Apply model chat template when supported by vLLM tokenizer."""
+    def _format_vllm_prompt(self, prompt: str, enable_cot: bool = True) -> str:
+        """Apply model chat template with synchronized system+user messages when supported by vLLM tokenizer."""
         if self.llm is None:
             return prompt
         try:
             tok = self.llm.get_tokenizer()
             if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None):
+                sys_msg = WRITER_SYSTEM_PROMPT_COT if enable_cot else WRITER_SYSTEM_PROMPT_DIRECT
                 return tok.apply_chat_template(
-                    [{"role": "user", "content": prompt}],
+                    [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}],
                     tokenize=False,
                     add_generation_prompt=True,
                 )
@@ -388,34 +487,16 @@ class VLLMWritingPolicy:
         active_chars = chapter_plan.get("characters_active", ["Protagonist"])
         scene_outline = chapter_plan.get("scene_outline", [])
         outline_str = "\n- ".join(scene_outline) if scene_outline else chapter_plan.get("chapter_goal", "")
-        target_words = chapter_plan.get("target_words", 1200)
+        target_words = int(chapter_plan.get("target_words", 1200) or 1200)
         conflict_directive = (
             f"\n[DIRECTIVE WARNING]: {chapter_plan['injected_contradiction']}"
             if chapter_plan.get("injected_contradiction")
             else ""
         )
 
-        cot_instructions = (
-            "CRITICAL WRITING INSTRUCTIONS:\n"
-            "1. Test-Time Reasoning (Chain-of-Thought):\n"
-            "   You MUST begin your response with a <think>...</think> block containing your step-by-step narrative plan:\n"
-            "   - Scene-by-scene pacing: Plan word distribution to strictly match each scene's target words.\n"
-            "   - Narrative transition: Hook directly into the preceding scene continuation without verbatim sentence repetition.\n"
-            "   - Tone & Sensory palette: Outline sensory imagery and avoid literal phrasing from the context summary.\n"
-            "2. Chapter Prose:\n"
-            "   Immediately after </think>, output ONLY the final narrative prose.\n"
-            "   - Seamlessly flow between scenes according to the budgets.\n"
-            "   - DO NOT include scene labels, section titles, author notes, or meta-commentary outside <think>.\n"
-            "Begin with <think> now:\n"
-            if enable_cot
-            else "CRITICAL WRITING INSTRUCTIONS:\n"
-            "Output ONLY the final narrative prose seamlessly executing every scene goal and target word budget.\n"
-            "DO NOT include scene labels, section titles, or meta-commentary.\n"
-        )
-
         ltm_block = format_long_term_memory_block(context_summary, max_total_words=220)
 
-        return f"""You are an elite literary novelist. Write the complete narrative prose for {chapter_plan.get('chapter_title', 'Chapter')}.
+        core_prompt = f"""You are an elite literary novelist. Write the complete narrative prose for {chapter_plan.get('chapter_title', 'Chapter')}.
 Total Target Length: Approximately {target_words} words.
 
 {ltm_block}[CONTEXT SUMMARY]:
@@ -426,9 +507,9 @@ Active Characters: {', '.join(active_chars)}
 {chapter_plan.get('chapter_goal', '')}
 
 [SCENE BREAKDOWN & WORD BUDGETS]:
-- {outline_str}
+- {outline_str}"""
 
-{cot_instructions}"""
+        return build_writer_chat_messages(core_prompt, target_words=target_words, enable_cot=enable_cot)[1]["content"]
 
     def _mock_prose(self, chapter_plan: Dict[str, Any], context_summary: Dict[str, Any]) -> str:
         ch_title = chapter_plan.get("chapter_title", "Chapter")

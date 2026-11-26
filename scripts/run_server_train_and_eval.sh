@@ -14,13 +14,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-export EXP_NAME="${EXP_NAME:-exp02_rlmr_orthogonal_32b_v2}"
+export EXP_NAME="${EXP_NAME:-exp02_rlmr_orthogonal_32b_v3}"
 export OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/${EXP_NAME}}"
 export MAX_STEPS="${MAX_STEPS:-160}"
 export EVAL_PROMPTS="${EVAL_PROMPTS:-3}"
 export EVAL_OUT_DIR="${EVAL_OUT_DIR:-eval_outputs/${EXP_NAME}_vs_base_${EVAL_PROMPTS}prompts}"
 export PYTHON_BIN="${PYTHON_BIN:-python3}"
-export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-0}"
 if [ -z "${HF_HOME:-}" ] && [ -d "/user-data" ]; then
   export HF_HOME="/user-data/.hf_cache"
 fi

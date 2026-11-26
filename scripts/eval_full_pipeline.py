@@ -31,7 +31,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.coordinator import CoordinatorAgent
-from src.pipeline import VLLMWritingPolicy, deduplicate_repeated_paragraphs, extract_cot_and_prose
+from src.pipeline import (
+    VLLMWritingPolicy,
+    build_writer_chat_messages,
+    deduplicate_repeated_paragraphs,
+    extract_cot_and_prose,
+)
 from src.planning import OutlineAgent, PlanningAgent
 from src.rewards import count_words
 from experiments.benchmark.evaluator import (
@@ -305,13 +310,14 @@ def run_phase2_generation(
                 prev_ctx = ctx_state
 
                 prompt = policy_helper.construct_prompt(ch_plan, ctx_state, enable_cot=True)
-                raw_out = hf_chat_generate(model, [{"role": "user", "content": prompt}], max_chapter_tokens, 0.7, 0.9)
+                chat_messages = build_writer_chat_messages(prompt, target_words=target_w, enable_cot=True)
+                raw_out = hf_chat_generate(model, chat_messages, max_chapter_tokens, 0.75, 0.92)
                 cot_txt, prose_txt = extract_cot_and_prose(raw_out)
                 prose_dedup, removed = deduplicate_repeated_paragraphs(prose_txt, min_words=30, min_sentence_words=12)
 
                 if removed > 0 and count_words(prose_dedup) < int(0.75 * target_w):
                     raw_retry = hf_chat_generate(
-                        model, [{"role": "user", "content": prompt}], max_chapter_tokens, 0.85, 0.92
+                        model, chat_messages, max_chapter_tokens, 0.85, 0.92
                     )
                     cot_r, prose_r = extract_cot_and_prose(raw_retry)
                     prose_r_dedup, removed_r = deduplicate_repeated_paragraphs(
